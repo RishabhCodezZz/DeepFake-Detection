@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Model checkpoints and extracted features -- these live on Kaggle as
+# Datasets (crops-v5, crossfuse-v5-ckpt, ...), not in git.
+*.pth
+*.pt
+*.npy
+*.npz
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Notebook backups
+*.ipynb.bak
+.ipynb_checkpoints/
+
+# Data
+data/
+crops_v5/
+*.mp4
+*.avi
+*.wav
+*.flac
