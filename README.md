@@ -104,15 +104,23 @@ Split this way so no stage approaches Kaggle's 12-hour session limit.
 
 | Notebook | Purpose |
 |---|---|
-| `v5-A-extract.ipynb` | FakeAVCeleb face crops + cached audio features → `crops-v5` |
-| `v5-A2-ffpp-extract.ipynb` | FF++ real-video crops (for SBI) |
-| `v5-B0-sbi-pretrain.ipynb` | SBI visual pretraining (**cut — see above**) |
-| `v5-B-train.ipynb` | Multimodal training → `crossfuse-v5-ckpt` |
-| `v5-C-eval.ipynb` | Calibration, test report, cross-dataset suite, figures |
-| `v5-D-ablations.ipynb` | Ablation grid → `ablation_results_v5.csv` |
+| `notebooks/A-extract.ipynb` | FakeAVCeleb face crops + cached audio features → `crops-v5` |
+| `notebooks/A2-ffpp-extract.ipynb` | FF++ real-video crops (for SBI) |
+| `notebooks/B0-sbi-pretrain.ipynb` | SBI visual pretraining (**cut — see above**) |
+| `notebooks/B-train.ipynb` | Multimodal training → `crossfuse-v5-ckpt` |
+| `notebooks/C-eval.ipynb` | Calibration, test report, cross-dataset suite, figures |
+| `notebooks/D-ablations.ipynb` | Ablation grid → `ablation_results_v5.csv` |
 
-`crossfuse_v5.py` and `sbi_v5.py` are uploaded as a Kaggle Dataset
-(`crossfuse-v5-lib`) and imported by every notebook.
+`crossfuse_v5.py` and `sbi_v5.py` (repo root) are uploaded as a Kaggle Dataset
+(`crossfuse-v5-lib`) and imported by every notebook. The module names are kept
+as-is even though the surrounding project no longer uses "v5" in file/folder
+names elsewhere — every notebook's import and `glob` search hardcodes these
+exact filenames, and the Kaggle dataset you're using is named after them, so
+renaming them would require re-uploading to Kaggle and would break re-running
+any notebook from this repo against your existing Kaggle setup. Rename them
+together (module names + every notebook's imports/globs + the Kaggle dataset)
+if you want that consistency later — not done here to avoid breaking the
+working pipeline silently.
 
 Audio features (MFCC in both trimmed and untrimmed variants, plus full-clip
 log-mel) are cached at extraction time, which keeps librosa off the training
@@ -129,10 +137,3 @@ NumPy-2.0-only submodule while pinning NumPy 1.26.
 
 FakeAVCeleb (training), DFDC sample and Celeb-DF v2 (zero-shot evaluation),
 FaceForensics++ c23 (SBI attempt). None are redistributed here.
-
-## Earlier iterations
-
-`deepfake-v3.1` … `deepfake v4.ipynb` are kept for provenance. v4 is the
-immediate predecessor: correct in approach but scheduled as a ~15–20 hour job
-on a platform that terminates at 12 hours, which is what prompted the v5
-restructuring into independently-runnable stages.
