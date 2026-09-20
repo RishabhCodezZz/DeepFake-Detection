@@ -4,13 +4,20 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.pytest_cache/
 
-# Model checkpoints and extracted features -- these live on Kaggle as
-# Datasets (crops-v5, crossfuse-v5-ckpt, ...), not in git.
+# Model checkpoints and extracted features -- these live on Kaggle as Datasets
+# (crops-v5, ffpp-crops-v5, ffpp-encoder-v5, crossfuse-v5-ckpt-1, ...), not in git.
+# The trained CLIP checkpoint (crossfuse_v5_main_s42.pth) exists ONLY in the
+# Kaggle dataset crossfuse-v5-ckpt-1 -- do not delete that dataset.
 *.pth
 *.pt
 *.npy
 *.npz
+
+# Kaggle auto-generated notebook-output leftovers (downloaded with results)
+results/__results___files/
+results/__huggingface_repos__.json
 
 # Editor / OS
 .vscode/

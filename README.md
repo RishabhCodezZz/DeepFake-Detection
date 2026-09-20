@@ -166,8 +166,10 @@ Pipeline for this track: `A3-ffpp-full-extract` -> `B1-ffpp-pretrain` (gate) ->
 
 ## Pipeline
 
-Six Kaggle notebooks, each publishing its output as a Dataset for the next.
-Split this way so no stage approaches Kaggle's 12-hour session limit.
+The paper pipeline is six Kaggle notebooks (`A`, `A2`, `B0`, `B`, `C`, `D`), each
+publishing its output as a Dataset for the next; the post-paper track adds `A3`, `B1`,
+`B2` and `D2`. Split this way so no stage approaches Kaggle's 9-hour GPU session cap
+(runs also carry a wall-clock budget that stops them cleanly with their best checkpoint).
 
 | Notebook | Purpose |
 |---|---|
@@ -182,8 +184,10 @@ Split this way so no stage approaches Kaggle's 12-hour session limit.
 | `notebooks/B2-sync-probe.ipynb` | *(post-paper)* sync-head rewrite probe (negative result) |
 | `notebooks/D2-ablation-attribution.ipynb` | *(post-paper)* attribution ablation scored on cross-dataset AUC |
 
-`crossfuse_v5.py` and `sbi_v5.py` (repo root) are uploaded as a Kaggle Dataset
-(`crossfuse-v5-lib`) and imported by every notebook. The module names are kept
+`crossfuse_v5.py` and `ffpp_v5.py` (repo root; `sbi_v5.py` is the cut SBI stage, kept for
+the record) are uploaded as a Kaggle Dataset (`crossfuse-v5-lib`) and imported by every
+notebook. Offline checks: `python -m pytest tests -q` (stopping rule) and
+`python verify_sync_fix.py` (69 CPU checks for the sync-head rewrite). The module names are kept
 as-is even though the surrounding project no longer uses "v5" in file/folder
 names elsewhere — every notebook's import and `glob` search hardcodes these
 exact filenames, and the Kaggle dataset you're using is named after them, so
@@ -207,4 +211,5 @@ NumPy-2.0-only submodule while pinning NumPy 1.26.
 ## Datasets
 
 FakeAVCeleb (training), DFDC sample and Celeb-DF v2 (zero-shot evaluation),
-FaceForensics++ c23 (SBI attempt). None are redistributed here.
+FaceForensics++ c23 (the cut SBI attempt and, post-paper, the CLIP pretraining and
+training mixture). None are redistributed here.

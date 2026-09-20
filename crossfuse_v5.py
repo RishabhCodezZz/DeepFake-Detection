@@ -36,8 +36,9 @@ WHAT CHANGED FROM v4, AND WHY
    forgery task.  The clip-level head remains the reported verdict.
 
 4. Configurable backbone.  The visual encoder is built by name so the
-   FakeAVCeleb multimodal model and the FF++/SBI pretrained encoder are the
-   same architecture and weights transfer directly.
+   FakeAVCeleb multimodal model and the FF++-pretrained encoder (CLIP
+   ViT-L/14 from NB-B1; the earlier SBI attempt was cut) are the same
+   architecture and weights transfer directly.
 
 5. Paired batching.  GenD (arXiv:2508.06248) finds that batching real and
    fake from the SAME source identity is what suppresses shortcut learning.
@@ -219,6 +220,12 @@ CONFIG = {
     # and the audio token at every relative offset k in [-SYNC_MAX_OFFSET,
     # SYNC_MAX_OFFSET], averaged over time -> a profile that CAN distinguish
     # "peaks at k=0" (matched) from "flat / peaks elsewhere" (shifted).
+    # STATUS (2026-09): the sync head is CUT as a reportable signal. Both archs
+    # failed the preregistered SYNC_MIN_AUC gate on FakeAVCeleb (pooled_ca
+    # 0.5062, offset_profile 0.5129 val AUC); offset_profile does find the right
+    # offset (100% top-1) but the corpus has no natural desync to learn from.
+    # It is still built and trained by default so the 4-head model and its
+    # checkpoints stay unchanged; results report `sync_reportable=False`.
     "SYNC_ARCH":               "offset_profile",
     # Max |offset| in VIDEO frames the profile scores. Must be small enough
     # that AUDIO_FRAMES/SYNC_MEL_FRAMES still cover the widened window (see
@@ -276,12 +283,12 @@ CONFIG = {
     "SYNC_MIN_AUC":            0.70,   # PREREGISTERED
     "NUM_WORKERS":             4,
     "WORK_DIR":                "/kaggle/working",
-    # DataParallel's master GPU gathers every replica's output for loss
-    # computation and gradient reduction, so it carries more than its even
-    # share of memory -- this crashed a live 2xT4 SBI run (kernel died) at
-    # efficientnet_b4 + res 380 + effective batch 32. Off by default until
-    # re-validated with a smaller effective batch; the sharding code in
-    # CrossFuseModelV5.enable_multi_gpu is still here to flip back on.
+    # KEEP OFF. nn.DataParallel has failed three times on this project: it crashed
+    # a live 2xT4 SBI run (kernel died; the master GPU gathers every replica's
+    # output), it stalled a small EfficientNet probe, and on CLIP ViT-L/14 it ran
+    # ~3x SLOWER than one GPU (2904s vs 934.7s per epoch) because it re-replicates
+    # the whole 303M-param backbone on every forward call. See the Invariants
+    # section of CLAUDE.md and the docstring of CrossFuseModelV5.enable_multi_gpu.
     "MULTI_GPU":               False,
 }
 
@@ -1124,11 +1131,13 @@ class CrossFuseModelV5(nn.Module):
         so wrapping just that shards the images across GPUs correctly while
         the cheap heads stay on cuda:0.
 
-        UNVERIFIED FIX, not yet re-tested on Kaggle (see CLAUDE.md's Negative
-        results ledger -- MULTI_GPU has hung twice before: a live 2xT4 SBI
-        run, and a much smaller B2-sync-probe scale re-test with GPU
-        utilization ~0%). Two changes, addressing the two most-cited causes
-        of exactly this symptom (nn.DataParallel + Tesla T4 on a cloud VM):
+        TESTED 2026-09-03: the two changes below DID remove the hang (clean on
+        a 200-row probe and at full scale), but the run was ~3x slower -- see
+        the DO NOT USE note at the top of this docstring. Kept for reference.
+        Earlier history: MULTI_GPU had hung twice before (a live 2xT4 SBI run,
+        and a smaller B2-sync-probe re-test with GPU utilization ~0%). The
+        two changes address the two most-cited causes of that symptom
+        (nn.DataParallel + Tesla T4 on a cloud VM):
 
         1. NCCL_P2P_DISABLE=1 -- cloud multi-GPU VMs frequently report
            peer-to-peer access as available when the underlying
@@ -1136,9 +1145,9 @@ class CrossFuseModelV5(nn.Module):
            copy path (which DataParallel's scatter/gather use even without
            an explicit process group) hangs rather than erroring. This is
            the standard workaround, widely reported for exactly this
-           hardware pairing. Must be set before any CUDA op on the process,
-           so this method now refuses to be the first thing to touch
-           cuda -- call it before any tensor is moved to a GPU.
+           hardware pairing. Must be set before any CUDA op on the process;
+           this method only WARNS if CUDA is already initialised (see the
+           ordering note below).
         2. Gradient checkpointing OFF on the backbone once wrapped. This is
            the likelier cause: checkpointing re-runs the forward pass during
            backward through a saved function reference, and DataParallel
@@ -1150,10 +1159,8 @@ class CrossFuseModelV5(nn.Module):
            about to halve the per-GPU batch by construction, so the memory
            pressure checkpointing was solving is largely gone anyway.
 
-        Neither change has been validated against a real multi-GPU hang --
-        validate on a short, cheap probe (a handful of steps, not a full
-        epoch) before trusting it on an expensive run, same as every other
-        change in this codebase.
+        Lesson: a probe that only checks "does it hang" cannot catch a
+        throughput regression -- measure epoch time at real scale too.
 
         NCCL_P2P_DISABLE ordering: `run_training_pipeline` already does
         `build_model(cfg).to(device)` -- a real CUDA op -- BEFORE calling
