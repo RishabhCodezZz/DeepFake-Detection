@@ -1,0 +1,2 @@
+arm,backbone,n_train_rows,n_ffpp_rows,encoder,best_epoch,train_minutes,budget_min,stopped_by_time,indomain_test_video_auc,indomain_test_fusion_auc,dfdc_auc,dfdc_lo,dfdc_hi,dfdc_n,celebdf_auc,celebdf_lo,celebdf_hi,celebdf_n,mean_cross_auc
+A15_no_ffpp_pretrain,clip_vit_l14,5887,5000,none,7,421.1,401.3,True,0.9122706422018348,0.8999282296650718,0.7850243506493506,0.7343726909520141,0.8338620857309053,397,0.715769308328292,0.6447902705213824,0.7880672517293102,400,0.7503968294888212

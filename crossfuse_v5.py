@@ -44,6 +44,17 @@ WHAT CHANGED FROM v4, AND WHY
    `PairedBatchSampler` emits matched real/fake pairs from one identity
    group.
 
+6. CLIP backbone with LayerNorm-only tuning.  The EfficientNet/ImageNet
+   visual encoder transfers poorly: 0.95 AUC in-domain on FakeAVCeleb against
+   0.58/0.64 zero-shot on DFDC/Celeb-DF.  LNCLIP-DF (arXiv:2508.06248) and
+   Effort (ICML 2025, arXiv:2411.15633) independently converge on CLIP
+   ViT-L/14 frozen except its LayerNorm parameters, trained on FF++ c23.
+   LNCLIP-DF's ablation on Celeb-DF v2: linear probe 78.1 -> +LN-tuning 94.9
+   -> +L2-norm 96.2, while full fine-tuning and LoRA both overfit outright.
+   `CLIPVisualBackbone` implements the backbone; the freeze/LR helpers on
+   CrossFuseModelV5 branch to LN-tuning for it, since there are no CNN blocks
+   to apply layer-wise decay across.
+
 Carried over from v4 unchanged because it was correct: identity union-find
 grouping, contiguous crop extraction with per-frame validity, two-phase
 freeze->fine-tune with layer-wise LR decay, MC-Dropout + temperature scaling
@@ -60,7 +71,8 @@ import random
 import re
 import subprocess
 import tempfile
-from collections import defaultdict
+import time
+from collections import defaultdict, Counter
 
 import cv2
 import librosa
@@ -85,10 +97,27 @@ try:
 except ImportError:  # notebooks that only need the model/eval side
     MTCNN = None
 
-from torchvision.models import (
-    efficientnet_b0, efficientnet_b4,
-    EfficientNet_B0_Weights, EfficientNet_B4_Weights,
-)
+try:
+    # CLIP-only notebooks (e.g. B1-ffpp-pretrain) don't need this, and a
+    # torch/torchvision version mismatch introduced by installing another
+    # package without --no-deps (open_clip_torch, in B1's case) can break
+    # torchvision.models' efficientnet registration without touching CLIP at
+    # all. Fail loudly only if something actually tries to build an
+    # efficientnet_* backbone -- see the ValueError in build_backbone below.
+    from torchvision.models import (
+        efficientnet_b0, efficientnet_b4,
+        EfficientNet_B0_Weights, EfficientNet_B4_Weights,
+    )
+except (ImportError, RuntimeError) as _e:  # RuntimeError: torch/torchvision op-registration mismatch
+    efficientnet_b0 = efficientnet_b4 = None
+    EfficientNet_B0_Weights = EfficientNet_B4_Weights = None
+    _EFFICIENTNET_IMPORT_ERROR = _e
+
+try:
+    import open_clip
+except Exception as _oc_err:  # only the CLIP backbones need it (also tolerates a broken local torchvision)
+    open_clip = None
+    _OPEN_CLIP_IMPORT_ERROR = _oc_err   # surfaced in CLIPVisualBackbone, never swallowed silently
 
 __all__ = [
     "CONFIG", "seed_everything", "make_rng", "device",
@@ -98,13 +127,15 @@ __all__ = [
     "build_detector", "extract_face_crops_contiguous",
     "get_fakeavceleb_label", "get_fakeavceleb_category", "CATEGORY_SHORT",
     "category_to_modality_labels", "make_sample_key",
-    "TemporalConvNet", "masked_mean_std", "CrossFuseModelV5", "build_model",
-    "build_backbone", "load_visual_encoder",
+    "TemporalConvNet", "Chomp1d", "masked_mean_std", "offset_similarity_profile",
+    "MouthEncoder", "CrossFuseModelV5", "build_model",
+    "build_backbone", "CLIPVisualBackbone", "encode_frames", "image_norm_stats",
+    "load_visual_encoder",
     "portable_state_dict", "load_portable_state_dict",
     "unwrap", "enable_mc_dropout", "mc_logits",
     "CrossFuseCropDataset", "PairedBatchSampler", "worker_init_fn",
     "self_blend_clip", "compression_augment_clip", "photometric_augment_clip",
-    "build_3way_split_packed", "safe_auc", "smooth_labels",
+    "build_3way_split_packed", "merge_manifests", "safe_auc", "smooth_labels",
     "roc_auc_score", "roc_curve", "balanced_accuracy_score", "classification_report_text",
     "run_training_pipeline", "evaluate_deterministic",
     "mc_collect", "fit_temperature", "bootstrap_stable_threshold",
@@ -135,8 +166,18 @@ CONFIG = {
     "AUDIO_FRAMES":            128,
     "SYNC_MEL_FRAMES":         128,
     "N_MELS":                  80,
-    "BACKBONE":                "efficientnet_b4",
-    "FREEZE_BLOCKS":           4,
+    # CLIP ViT-L/14 with LayerNorm-only tuning, per LNCLIP-DF
+    # (arXiv:2508.06248) and Effort (arXiv:2411.15633).  Set BACKBONE to
+    # "efficientnet_b4" AND FREEZE_BLOCKS to 4 together to get the v5
+    # architecture back -- build_model raises on any other combination.
+    "BACKBONE":                "clip_vit_l14",
+    # CNN block depth to freeze.  On a ViT this is a two-state switch and
+    # MUST be 0: 0 trains the LayerNorms, >= 1 freezes the backbone entirely.
+    "FREEZE_BLOCKS":           0,
+    # ViT-L/14 at 224 px stores ~120 MB of activations per image over its 24
+    # layers; 12 clips x 12 frames = 144 images does not fit a 16 GB T4
+    # without this.  Costs roughly 30% extra compute.
+    "GRAD_CHECKPOINTING":      True,
     "TRAIN_RES":               224,    # crops are resized to this on-GPU
 
     # ---- The leading-silence shortcut --------------------------------
@@ -155,9 +196,54 @@ CONFIG = {
     "USE_FUSION_HEAD":         True,
     "LATE_FUSION_BASELINE":    False,
     "SYNC_DENSE_ALIGNED":      True,
+    # Fixed pixel box (row0, row1, col0, col1, as fractions of CROP_SIZE)
+    # the sync branch crops for its mouth token. Replaces the previous
+    # "bottom row of the shared backbone's 3x3 grid" token, which pooled a
+    # huge receptive field (chin/neck/background at very low resolution)
+    # nearly identical to the global v_tok -- consistent with train sync AUC
+    # sitting at chance rather than merely failing to generalize. This box
+    # is a fixed heuristic (not landmark-driven, since the main pipeline's
+    # cached crops carry no landmarks), sized generously to stay robust to
+    # per-clip face-box jitter from FACE_MARGIN=0.30 extraction.
+    "MOUTH_BOX_FRACS":         (0.55, 0.95, 0.25, 0.75),
+    # Sync head architecture. "pooled_ca" is the ORIGINAL branch (mouth<->mel
+    # cross-attention, both arms pooled by masked_mean_std before the
+    # classifier). It is provably invariant to any permutation of the audio
+    # timesteps -- no positional signal enters either cross-attention call,
+    # and mean/std pooling is itself permutation-invariant -- so it cannot
+    # represent timing at all, which is consistent with train AUC sitting at
+    # chance rather than merely failing to generalize (see the 0.5074
+    # reported result and the exactly-0.500 A10_sync_unaligned ablation).
+    # Kept selectable, not deleted, so both numbers stay reproducible.
+    # "offset_profile" is the fix: cosine similarity between the mouth token
+    # and the audio token at every relative offset k in [-SYNC_MAX_OFFSET,
+    # SYNC_MAX_OFFSET], averaged over time -> a profile that CAN distinguish
+    # "peaks at k=0" (matched) from "flat / peaks elsewhere" (shifted).
+    "SYNC_ARCH":               "offset_profile",
+    # Max |offset| in VIDEO frames the profile scores. Must be small enough
+    # that AUDIO_FRAMES/SYNC_MEL_FRAMES still cover the widened window (see
+    # the dataset's mel-slicing comment) but large enough to contain the
+    # negative shifts CrossFuseCropDataset draws (rng.uniform(0.4, dur/3)
+    # seconds -- SYNC_MAX_OFFSET is in frames, not seconds, so this is
+    # widened generously rather than tuned to that exact range).
+    "SYNC_MAX_OFFSET":         8,
+    "SYNC_EMB_DIM":            128,
+    # Auxiliary InfoNCE loss over the offset profile (target: k=0 for a
+    # matched window). Dense per-timestep-relationship supervision, instead
+    # of the one bit per clip the BCE sync loss alone provides. Only used
+    # when SYNC_ARCH == "offset_profile".
+    "LAMBDA_SYNC_NCE":         0.5,
+    # Softmax temperature for that InfoNCE loss. Raw cosine similarities live
+    # in [-1, 1]; dividing by a small temperature is what makes the profile
+    # sharp enough for cross-entropy over 2*SYNC_MAX_OFFSET+1 classes to give
+    # a useful gradient early in training.
+    "SYNC_NCE_TEMP":           0.1,
     "IDENTITY_DISJOINT_SPLIT": True,
     "USE_PAIRED_BATCHES":      True,
-    "SBI_PRETRAINED_ENCODER":  None,   # path to the FF++/SBI checkpoint
+    # Path to a visual-encoder checkpoint from the FF++ pretraining stage
+    # (NB-B1).  Was SBI_PRETRAINED_ENCODER in v5; the slot is the same, the
+    # occupant changed after SBI was cut.
+    "PRETRAINED_ENCODER":      None,
     "MODALITY":                "both",
     "HELD_OUT_CATEGORY":       None,
 
@@ -166,15 +252,21 @@ CONFIG = {
     "EPOCHS_FROZEN":           3,
     "EPOCHS_FINETUNE":         20,
     "PATIENCE":                6,
+    "TIME_BUDGET_S":           None,   # e.g. 7.5 * 3600 on Kaggle; None = no limit
     # 12x12 = 144 images/step, close to v4's 128, but 3x the labels per
     # step -- and with the frame head, 144 frame-level gradients as well.
     "BATCH_CLIPS":             12,
     "GRAD_ACCUM":              1,
     "LR_HEAD":                 1e-4,
-    # 1e-5, not v4's 3e-5: when the backbone starts from SBI-pretrained
-    # forensic features the job is to preserve them, not relearn them.
+    # 1e-5, not v4's 3e-5: when the backbone starts from pretrained forensic
+    # features the job is to preserve them, not relearn them.  CNN path only.
     "LR_BACKBONE":             1e-5,
     "LLRD":                    0.75,
+    # LN-tuning LR.  Separate from LR_BACKBONE because LR_BACKBONE is tuned
+    # for moving all 19M EfficientNet weights, and is roughly an order of
+    # magnitude too low to move CLIP's ~0.1M LayerNorm parameters.  This is
+    # the multimodal-stage value; the FF++ pretraining stage uses 1e-4.
+    "LR_LN":                   1e-5,
     "LAMBDA_FRAME":            0.5,
     "LAMBDA_SYNC":             0.5,
     "LAMBDA_FUSION":           0.5,
@@ -546,16 +638,145 @@ _BACKBONES = {
     "efficientnet_b4": (efficientnet_b4, EfficientNet_B4_Weights, 1792),
 }
 
+# open_clip model name -> (pretrained tag, width of the pre-projection CLS token)
+_CLIP_BACKBONES = {
+    # (open_clip arch, ordered pretrained tags to try, feature width).
+    # "openai" first because LNCLIP-DF and Effort both report against OpenAI
+    # CLIP; laion2b is a documented substitute rather than a silent one, and
+    # which tag actually loaded is printed and recorded in the checkpoint.
+    "clip_vit_l14": ("ViT-L-14", ("openai", "laion2b_s32b_b82k"), 1024),
+    "clip_vit_b16": ("ViT-B-16", ("openai", "laion2b_s34b_b88k"), 768),
+}
 
-def build_backbone(name, pretrained=True):
-    """(features_module, feature_dim).  Named construction so the SBI
+
+class CLIPVisualBackbone(nn.Module):
+    """CLIP visual transformer exposing the same call contract as the
+    EfficientNet `.features` module, but returning a pooled (N, D) token
+    instead of an (N, C, H, W) map.
+
+    Returns the CLS token BEFORE CLIP's image-text projection: the projection
+    is trained to align with text embeddings, which discards exactly the
+    low-level appearance detail forgery detection depends on.  Callers
+    (`CrossFuseModelV5.encode_visual`) L2-normalise it, following LNCLIP-DF.
+
+    Gradient checkpointing is on by default.  ViT-L/14 at 224 px stores
+    roughly 120 MB of activations per image across its 24 layers, so a
+    clip-level batch (12 clips x 12 frames = 144 images) does not fit in a
+    16 GB T4 without it.
+    """
+
+    is_vit = True
+
+    def __init__(self, name, pretrained=True, grad_checkpointing=True):
+        super().__init__()
+        if open_clip is None:
+            raise ImportError(
+                "open_clip is required for the CLIP backbones "
+                "(`pip install open_clip_torch`). Import failed with: "
+                f"{globals().get('_OPEN_CLIP_IMPORT_ERROR', 'not installed')!r}")
+        clip_name, tags, dim = _CLIP_BACKBONES[name]
+        self.pretrained_tag = None
+        if not pretrained:
+            model = open_clip.create_model(clip_name, pretrained=None)
+        else:
+            # open_clip resolves "openai" to a HuggingFace safetensors mirror
+            # when huggingface_hub is importable, and otherwise to OpenAI's
+            # original TorchScript .pt -- which torch>=2.6 refuses to load
+            # under weights_only=True.  Rather than let that surface as an
+            # opaque serialization error mid-session, walk the tag list and
+            # say which one worked.
+            errs = []
+            model = None
+            for tag in tags:
+                try:
+                    model = open_clip.create_model(clip_name, pretrained=tag)
+                    self.pretrained_tag = tag
+                    print(f"  [clip] {clip_name} loaded with pretrained tag '{tag}'")
+                    break
+                except Exception as e:
+                    errs.append(f"{tag}: {type(e).__name__}: {e}")
+            if model is None:
+                raise RuntimeError(
+                    f"could not load pretrained weights for {clip_name}. Tried "
+                    + " | ".join(errs)
+                    + ". On Kaggle make sure internet is enabled and "
+                      "`huggingface_hub` imports cleanly.")
+        self.visual = model.visual
+        # Drop the image-text projection so the module's output width is `dim`
+        # and no unused parameter shows up in the optimizer or the checkpoint.
+        self.visual.proj = None
+        self.out_dim = dim
+        self.image_size = getattr(self.visual, "image_size", 224)
+        if isinstance(self.image_size, (tuple, list)):
+            self.image_size = self.image_size[0]
+        if grad_checkpointing:
+            self.set_grad_checkpointing(True)
+
+    def set_grad_checkpointing(self, enable=True):
+        # open_clip exposes this on the transformer; guard so a version
+        # without it degrades to "more memory" rather than AttributeError.
+        trunk = getattr(self.visual, "transformer", None)
+        if trunk is not None and hasattr(trunk, "grad_checkpointing"):
+            trunk.grad_checkpointing = enable
+        return self
+
+    def layernorms(self):
+        return [m for m in self.modules() if isinstance(m, nn.LayerNorm)]
+
+    def check_input_res(self, train_res):
+        """A ViT's positional embedding table is sized for exactly one input
+        resolution.  Any other value fails with a tensor-size mismatch deep
+        inside open_clip's `_embeds`, which reads like a library bug rather
+        than a config error -- so name it here instead."""
+        if train_res != self.image_size:
+            raise ValueError(
+                f"TRAIN_RES={train_res} is incompatible with this CLIP backbone, "
+                f"whose positional embeddings are fixed at {self.image_size}. "
+                f"Set TRAIN_RES={self.image_size} (crops are still CACHED at "
+                f"CROP_SIZE and resized on-GPU).")
+
+    def forward(self, x):
+        """x: (N, 3, H, W) already normalised -> (N, out_dim)."""
+        return self.visual(x)
+
+
+def build_backbone(name, pretrained=True, grad_checkpointing=True):
+    """(features_module, feature_dim).  Named construction so the FF++
     pretraining stage and the multimodal stage instantiate the SAME
-    architecture and weights transfer without surgery."""
+    architecture and weights transfer without surgery.
+
+    CNN backbones return a spatial map and are consumed through
+    `spatial_pool`; CLIP backbones return a pooled CLS token directly.  Every
+    caller must branch on `getattr(backbone, "is_vit", False)` rather than on
+    the name string.
+    """
+    if name in _CLIP_BACKBONES:
+        bb = CLIPVisualBackbone(name, pretrained, grad_checkpointing)
+        return bb, bb.out_dim
     if name not in _BACKBONES:
-        raise ValueError(f"Unknown backbone '{name}'; choose from {list(_BACKBONES)}")
+        raise ValueError(f"Unknown backbone '{name}'; choose from "
+                         f"{list(_BACKBONES) + list(_CLIP_BACKBONES)}")
     ctor, weights_enum, dim = _BACKBONES[name]
+    if ctor is None:
+        raise ImportError(
+            f"backbone='{name}' needs torchvision.models.{name}, which failed "
+            f"to import at module load time (see _EFFICIENTNET_IMPORT_ERROR): "
+            f"{_EFFICIENTNET_IMPORT_ERROR}. Likely a torch/torchvision version "
+            f"mismatch from a pip install without --no-deps -- check `import "
+            f"torch, torchvision; print(torch.__version__, torchvision.__version__)`.")
     weights = weights_enum.DEFAULT if pretrained else None
     return ctor(weights=weights).features, dim
+
+
+class Chomp1d(nn.Module):
+    """See TemporalConvNet(causal=True)."""
+
+    def __init__(self, chomp_size):
+        super().__init__()
+        self.chomp_size = chomp_size
+
+    def forward(self, x):
+        return x[:, :, :-self.chomp_size] if self.chomp_size > 0 else x
 
 
 class TemporalConvNet(nn.Module):
@@ -564,17 +785,31 @@ class TemporalConvNet(nn.Module):
     head) and the 80-band log-mel (sync head)."""
 
     def __init__(self, num_inputs=40, num_channels=(64, 128, 256), kernel_size=3,
-                 dropout=0.3, target_seq_len=60, out_dim=256):
+                 dropout=0.3, target_seq_len=60, out_dim=256, causal=False):
+        """`causal=True` chomps each conv's trailing, padding-induced growth
+        back off (the standard TCN "Chomp1d" trick: Bai et al. 2018), so
+        every layer's output length equals its input length instead of
+        growing by dilation*(kernel-1) per layer. Off by default --
+        audio_encoder and the pooled_ca sync path's mel_encoder already work
+        well (0.986 / n/a AUC) and are left byte-for-byte unchanged. Only
+        offset_audio_encoder (the offset-profile sync head) sets this: its
+        whole premise is that output index i is a precise, undistorted
+        instant of the input window, and on the short inputs that path uses
+        (~window_frames + 2*SYNC_MAX_OFFSET frames, not AUDIO_FRAMES=128),
+        uncorrected growth compounds to a large fraction of the sequence
+        length and would blur exactly the correspondence it depends on.
+        """
         super().__init__()
         layers = []
         for i, out_channels in enumerate(num_channels):
             dilation = 2 ** i
             in_channels = num_inputs if i == 0 else num_channels[i - 1]
-            layers += [
-                nn.Conv1d(in_channels, out_channels, kernel_size,
-                          padding=(kernel_size - 1) * dilation, dilation=dilation),
-                nn.BatchNorm1d(out_channels), nn.ReLU(), nn.Dropout(dropout),
-            ]
+            pad = (kernel_size - 1) * dilation
+            layers.append(nn.Conv1d(in_channels, out_channels, kernel_size,
+                                    padding=pad, dilation=dilation))
+            if causal:
+                layers.append(Chomp1d(pad))
+            layers += [nn.BatchNorm1d(out_channels), nn.ReLU(), nn.Dropout(dropout)]
         self.network = nn.Sequential(*layers)
         self.temporal_pool = nn.AdaptiveAvgPool1d(target_seq_len)
         self.proj = nn.Linear(num_channels[-1], out_dim)
@@ -582,6 +817,39 @@ class TemporalConvNet(nn.Module):
     def forward(self, x):
         out = self.temporal_pool(self.network(x)).transpose(1, 2)
         return self.proj(out)
+
+
+def offset_similarity_profile(mouth_emb, audio_emb, visual_mask, max_offset):
+    """Core computation of the offset-profile sync head, factored out of
+    CrossFuseModelV5._sync_offset_profile so it can be exercised directly
+    with SYNTHETIC embeddings (see the offline verification script) -- that
+    is the only way to check "does this peak at k=0 when the input is truly
+    aligned" without depending on trained (or random-init) network weights
+    to happen to produce a meaningful alignment.
+
+    mouth_emb: (B, W, E), L2-normalised.
+    audio_emb: (B, W + 2*max_offset, E), L2-normalised -- index
+        (t + max_offset + k) is the audio at the same instant as mouth frame
+        t, offset by k frames.
+    visual_mask: (B, W) bool, True = valid frame.
+
+    Returns (B, 2*max_offset + 1): profile[b, max_offset + k] is the mean
+    cosine similarity between mouth and audio at relative offset k, averaged
+    over valid mouth frames. NOT invariant to permuting audio_emb's time
+    axis -- each term ties a specific mouth frame to a specific offset audio
+    frame before any pooling happens, unlike masked_mean_std.
+    """
+    B, W = mouth_emb.shape[0], mouth_emb.shape[1]
+    K = max_offset
+    sims = []
+    for k in range(-K, K + 1):
+        a_shift = audio_emb[:, K + k: K + k + W, :]    # (B, W, E) -- audio at mouth-index t, offset k
+        sims.append((mouth_emb * a_shift).sum(-1))       # (B, W)
+    sim = torch.stack(sims, dim=-1)                       # (B, W, 2K+1)
+
+    mask_f = visual_mask.unsqueeze(-1).float()
+    denom = mask_f.sum(dim=1).clamp(min=1.0)
+    return (sim * mask_f).sum(dim=1) / denom              # (B, 2K+1), mean over valid frames
 
 
 def masked_mean_std(x, mask=None, eps=1e-8):
@@ -605,6 +873,95 @@ def _mlp_head(in_dim, hidden, dropout):
         nn.Linear(hidden, 1))
 
 
+class MouthEncoder(nn.Module):
+    """Small CNN trained from scratch on the cropped mouth region, followed by
+    a lightweight temporal stack over the clip's T frames.
+
+    Deliberately separate from the shared EfficientNet backbone: SyncNet-style
+    lip-sync networks are known to work well at this scale even on modest
+    data, and keeping this encoder small and dedicated means its only route
+    to a good sync score is actually resolving mouth motion, not reusing
+    whatever global forensic features the video head already learned.
+    AdaptiveAvgPool2d at the end means the input spatial size is unconstrained,
+    so no resize step is needed before calling this.
+
+    The per-frame CNN alone can only encode mouth APPEARANCE at each instant --
+    it has no way to represent mouth MOTION, which is what lip-sync actually
+    depends on. The small dilated Conv1d stack below gives each frame's token
+    a handful of neighbouring frames of context (receptive field 7) before it
+    reaches the sync branch's cross-attention. Cheap: T is WINDOW_FRAMES (12)."""
+
+    def __init__(self, out_dim, in_channels=3):
+        super().__init__()
+
+        def block(cin, cout):
+            return nn.Sequential(
+                nn.Conv2d(cin, cout, 3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(cout), nn.ReLU(inplace=True))
+
+        self.net = nn.Sequential(block(in_channels, 32), block(32, 64),
+                                 block(64, 128), block(128, 128))
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.temporal = nn.Sequential(
+            nn.Conv1d(128, 128, 3, padding=1), nn.BatchNorm1d(128), nn.ReLU(inplace=True),
+            nn.Conv1d(128, 128, 3, padding=2, dilation=2), nn.BatchNorm1d(128), nn.ReLU(inplace=True))
+        self.out = nn.Linear(128, out_dim)
+        self.register_buffer("img_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("img_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def forward(self, x_uint8):
+        """x_uint8: (B, T, H, W, 3) uint8 -> (B, T, out_dim)."""
+        B, T = x_uint8.shape[0], x_uint8.shape[1]
+        x = x_uint8.reshape(B * T, *x_uint8.shape[2:]).permute(0, 3, 1, 2).float().div_(255.0)
+        x = (x - self.img_mean) / self.img_std
+        f = self.pool(self.net(x)).flatten(1)              # (B*T, 128)
+        f = f.view(B, T, 128).transpose(1, 2)               # (B, 128, T)
+        f = self.temporal(f).transpose(1, 2)                 # (B, T, 128)
+        return self.out(f)
+
+
+def image_norm_stats(is_vit):
+    """(mean, std) channel statistics for the backbone family.
+
+    CLIP was pretrained under its own statistics, not ImageNet's.  Feeding it
+    ImageNet-normalised pixels shifts every activation and costs a large part
+    of what makes the features worth borrowing.  Shared by CrossFuseModelV5
+    and the FF++ pretraining classifier for the same reason `encode_frames`
+    is shared."""
+    if is_vit:
+        return ((0.48145466, 0.4578275, 0.40821073),
+                (0.26862954, 0.26130258, 0.27577711))
+    return (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
+
+
+def encode_frames(backbone, x_uint8, img_mean, img_std, train_res,
+                  is_vit, spatial_pool=None):
+    """(N, H, W, 3) uint8 -> (N, D) visual token.
+
+    SINGLE SOURCE OF TRUTH for how pixels become a visual token.  Both
+    `CrossFuseModelV5.encode_visual` and the FF++ pretraining classifier in
+    `ffpp_v5.py` route through here.  If those two ever computed tokens
+    differently -- a different resize, normalisation constant, or pooling --
+    the pretrained encoder would still LOAD cleanly and simply stop
+    transferring, which is close to undiagnosable from the training curves.
+
+    CNN backbones return a spatial map, pooled to a 3x3 grid then averaged.
+    ViT backbones already return a pooled CLS token; it is L2-normalised onto
+    the unit hypersphere, following LNCLIP-DF (arXiv:2508.06248), which both
+    adds ~1.3 AUROC on Celeb-DF v2 and stops per-clip feature-norm
+    differences (which track capture conditions, not manipulation) from
+    reaching the heads at all.
+    """
+    x = x_uint8.permute(0, 3, 1, 2).float().div_(255.0)
+    if x.shape[-1] != train_res:
+        x = F.interpolate(x, size=(train_res, train_res),
+                          mode="bilinear", align_corners=False)
+    x = (x - img_mean) / img_std
+    if is_vit:
+        return F.normalize(backbone(x), dim=-1)
+    return spatial_pool(backbone(x)).mean(dim=(2, 3))
+
+
 class CrossFuseModelV5(nn.Module):
     """
     Heads
@@ -625,7 +982,10 @@ class CrossFuseModelV5(nn.Module):
                  window_frames=12, n_mels=80, backbone="efficientnet_b4",
                  train_res=224, use_cross_attention=True, use_sync_head=True,
                  use_fusion_head=True, late_fusion_baseline=False,
-                 sync_dense_aligned=True, freeze_blocks=4, pretrained=True):
+                 sync_dense_aligned=True, freeze_blocks=4, pretrained=True,
+                 mouth_box_fracs=(0.55, 0.95, 0.25, 0.75),
+                 grad_checkpointing=True, sync_arch="offset_profile",
+                 sync_max_offset=8, sync_emb_dim=128):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.train_res = train_res
@@ -635,11 +995,19 @@ class CrossFuseModelV5(nn.Module):
         self.late_fusion_baseline = late_fusion_baseline
         self.sync_dense_aligned = sync_dense_aligned
         self.freeze_blocks = freeze_blocks
+        self.mouth_box_fracs = mouth_box_fracs
+        self.sync_arch = sync_arch
+        self.sync_max_offset = sync_max_offset
 
-        self.backbone, self.backbone_dim = build_backbone(backbone, pretrained)
+        self.backbone, self.backbone_dim = build_backbone(
+            backbone, pretrained, grad_checkpointing)
+        self.backbone_is_vit = getattr(self.backbone, "is_vit", False)
+        if self.backbone_is_vit:
+            self.backbone.check_input_res(train_res)
         self.spatial_pool = nn.AdaptiveAvgPool2d(3)
-        self.register_buffer("img_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer("img_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+        mean, std = image_norm_stats(self.backbone_is_vit)
+        self.register_buffer("img_mean", torch.tensor(mean).view(1, 3, 1, 1))
+        self.register_buffer("img_std", torch.tensor(std).view(1, 3, 1, 1))
         self.set_backbone_trainable(freeze_blocks)
 
         # ---- Visual branch (feeds video_head ONLY) ---------------------
@@ -660,18 +1028,42 @@ class CrossFuseModelV5(nn.Module):
 
         # ---- Sync branch ----------------------------------------------
         if self.use_sync_head:
+            self.mouth_encoder = MouthEncoder(self.backbone_dim)
             self.mouth_proj = nn.Linear(self.backbone_dim, hidden_dim)
             sync_in = n_mels if sync_dense_aligned else 40
-            self.mel_encoder = TemporalConvNet(num_inputs=sync_in,
-                                               target_seq_len=2 * window_frames,
-                                               dropout=0.3, out_dim=hidden_dim)
-            self.sync_ca_m2a = nn.MultiheadAttention(hidden_dim, num_heads,
-                                                     dropout=dropout, batch_first=True)
-            self.sync_ca_a2m = nn.MultiheadAttention(hidden_dim, num_heads,
-                                                     dropout=dropout, batch_first=True)
-            self.sync_ln_m = nn.LayerNorm(hidden_dim)
-            self.sync_ln_a = nn.LayerNorm(hidden_dim)
-            self.sync_head = _mlp_head(4 * hidden_dim, 128, dropout)
+
+            if self.sync_arch == "offset_profile":
+                # No time base to profile an offset over once the mel slice
+                # is decoupled from the video window's timing -- that ablation
+                # stays on "pooled_ca" (see build_model's assertion).
+                assert sync_dense_aligned, (
+                    "SYNC_ARCH='offset_profile' requires SYNC_DENSE_ALIGNED=True; "
+                    "use 'pooled_ca' for the A10_sync_unaligned ablation.")
+                K = sync_max_offset
+                # Encodes the WIDENED mel slice CrossFuseCropDataset produces
+                # for this arch (see its docstring) to exactly window_frames +
+                # 2K steps, so audio index (t + K + k) is the audio at the
+                # same instant as mouth/video frame t, offset by k frames.
+                self.offset_audio_encoder = TemporalConvNet(
+                    num_inputs=sync_in, target_seq_len=window_frames + 2 * K,
+                    dropout=0.3, out_dim=hidden_dim, causal=True)
+                self.sync_mouth_emb = nn.Linear(hidden_dim, sync_emb_dim)
+                self.sync_audio_emb = nn.Linear(hidden_dim, sync_emb_dim)
+                # Input is the (2K+1)-length cosine-similarity profile, not a
+                # pooled representation -- small on purpose, there is very
+                # little to overfit to in a similarity curve.
+                self.sync_head = _mlp_head(2 * K + 1, 64, dropout)
+            else:
+                self.mel_encoder = TemporalConvNet(num_inputs=sync_in,
+                                                   target_seq_len=2 * window_frames,
+                                                   dropout=0.3, out_dim=hidden_dim)
+                self.sync_ca_m2a = nn.MultiheadAttention(hidden_dim, num_heads,
+                                                         dropout=dropout, batch_first=True)
+                self.sync_ca_a2m = nn.MultiheadAttention(hidden_dim, num_heads,
+                                                         dropout=dropout, batch_first=True)
+                self.sync_ln_m = nn.LayerNorm(hidden_dim)
+                self.sync_ln_a = nn.LayerNorm(hidden_dim)
+                self.sync_head = _mlp_head(4 * hidden_dim, 128, dropout)
 
         # ---- Fusion branch --------------------------------------------
         # Both arms produce 4*hidden and pass through an identically shaped
@@ -696,8 +1088,32 @@ class CrossFuseModelV5(nn.Module):
         return (self.backbone.module if isinstance(self.backbone, nn.DataParallel)
                 else self.backbone)
 
+    def n_backbone_blocks(self):
+        """Value of `freeze_blocks` that freezes the backbone completely.
+
+        For a CNN that is the block count.  A ViT has no block interface --
+        `set_backbone_trainable` treats it as a two-state switch -- so any
+        value >= 1 means "fully frozen" and 1 is the honest answer."""
+        return 1 if self.backbone_is_vit else len(self.raw_backbone())
+
     def enable_multi_gpu(self):
         """Wrap ONLY the visual backbone in DataParallel.
+
+        DO NOT USE for clip_vit_l14 at real training scale -- confirmed on a
+        live 2xT4 B-train run (2026-09-03): the hang from earlier attempts
+        was gone (NCCL_P2P_DISABLE + no-checkpointing fix below), but each
+        fine-tune epoch took ~2904s vs. 934.7s single-GPU on the same
+        5,887-row dataset -- ~3x SLOWER, consistent across 5 consecutive
+        epochs, not noise. Root cause: nn.DataParallel re-replicates the
+        ENTIRE wrapped module to every non-primary GPU on EVERY forward
+        call, not once. ViT-L/14 is 303M params, and BATCH_CLIPS=4 means
+        ~1,400+ forward calls per epoch -- the replication overhead
+        dominates. Small-scale probes (notebooks/multigpu-probe.ipynb, 200
+        rows) only checked for a hang, not throughput, and passed cleanly
+        right before this -- a "no hang" result at tiny scale does not mean
+        "faster" at real scale for a model this size. Left in place for
+        smaller backbones (efficientnet_b4) where replication cost is
+        proportionally tiny, but for clip_vit_l14 stay single-GPU.
 
         The training loop calls encode_visual()/forward_from_tokens()
         directly rather than forward(), and DataParallel only intercepts
@@ -706,33 +1122,115 @@ class CrossFuseModelV5(nn.Module):
         backbone is where the B*T image compute actually is, and
         encode_visual invokes it as self.backbone(x), a real forward call,
         so wrapping just that shards the images across GPUs correctly while
-        the cheap heads stay on cuda:0."""
+        the cheap heads stay on cuda:0.
+
+        UNVERIFIED FIX, not yet re-tested on Kaggle (see CLAUDE.md's Negative
+        results ledger -- MULTI_GPU has hung twice before: a live 2xT4 SBI
+        run, and a much smaller B2-sync-probe scale re-test with GPU
+        utilization ~0%). Two changes, addressing the two most-cited causes
+        of exactly this symptom (nn.DataParallel + Tesla T4 on a cloud VM):
+
+        1. NCCL_P2P_DISABLE=1 -- cloud multi-GPU VMs frequently report
+           peer-to-peer access as available when the underlying
+           virtualization doesn't actually support it, and PyTorch's P2P
+           copy path (which DataParallel's scatter/gather use even without
+           an explicit process group) hangs rather than erroring. This is
+           the standard workaround, widely reported for exactly this
+           hardware pairing. Must be set before any CUDA op on the process,
+           so this method now refuses to be the first thing to touch
+           cuda -- call it before any tensor is moved to a GPU.
+        2. Gradient checkpointing OFF on the backbone once wrapped. This is
+           the likelier cause: checkpointing re-runs the forward pass during
+           backward through a saved function reference, and DataParallel
+           re-replicates the module on EVERY forward call -- the two
+           features are documented to interact badly (mismatched
+           requires_grad/autograd state across per-call replicas). This is
+           also why disabling it isn't a real loss here: checkpointing
+           exists to fit a full batch in one T4's 16GB, and DataParallel is
+           about to halve the per-GPU batch by construction, so the memory
+           pressure checkpointing was solving is largely gone anyway.
+
+        Neither change has been validated against a real multi-GPU hang --
+        validate on a short, cheap probe (a handful of steps, not a full
+        epoch) before trusting it on an expensive run, same as every other
+        change in this codebase.
+
+        NCCL_P2P_DISABLE ordering: `run_training_pipeline` already does
+        `build_model(cfg).to(device)` -- a real CUDA op -- BEFORE calling
+        this method, and is itself called more than once per notebook (the
+        timing probe, then once per seed) in the same kernel process. So by
+        the time this line runs on the call that matters, CUDA has already
+        been touched, possibly minutes earlier. `os.environ.setdefault`
+        below is best-effort, not a fix by itself -- set
+        `NCCL_P2P_DISABLE=1` as the FIRST line of the notebook's FIRST cell,
+        before `import torch`, for it to reliably take effect.
+        """
         if torch.cuda.device_count() > 1 and not isinstance(self.backbone, nn.DataParallel):
+            if torch.cuda.is_initialized() and os.environ.get("NCCL_P2P_DISABLE") != "1":
+                print("[enable_multi_gpu] WARNING: CUDA already initialized and "
+                      "NCCL_P2P_DISABLE isn't set -- set it as the first line of "
+                      "the notebook's first cell (before `import torch`) instead "
+                      "of relying on this method to set it in time.")
+            os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+            if hasattr(self.backbone, "set_grad_checkpointing"):
+                self.backbone.set_grad_checkpointing(False)
             self.backbone = nn.DataParallel(self.backbone)
         return self
 
     def set_backbone_trainable(self, freeze_blocks):
-        """features[:freeze_blocks] frozen, with their BatchNorms pinned to
-        eval so a ~1.5k-clip dataset cannot drift pretrained low-level
-        filters."""
+        """CNN: features[:freeze_blocks] frozen, with their BatchNorms pinned
+        to eval so a ~1.5k-clip dataset cannot drift pretrained low-level
+        filters.
+
+        ViT: LN-tuning instead -- everything frozen except LayerNorm affine
+        parameters (~0.03% of weights).  `freeze_blocks` becomes a two-state
+        switch rather than a depth: 0 unfreezes the LayerNorms, anything
+        >= 1 freezes the backbone completely (which is what the phase-1 head
+        warmup wants -- it passes `n_backbone_blocks()`).  Full fine-tuning
+        is deliberately not reachable here; it is the configuration
+        LNCLIP-DF measured overfitting with.
+        """
         self.freeze_blocks = freeze_blocks
-        for i, block in enumerate(self.raw_backbone()):
+        raw = self.raw_backbone()
+        if self.backbone_is_vit:
+            train_ln = freeze_blocks == 0
+            for p in raw.parameters():
+                p.requires_grad = False
+            if train_ln:
+                for ln in raw.layernorms():
+                    for p in ln.parameters():
+                        p.requires_grad = True
+            return
+        for i, block in enumerate(raw):
             for p in block.parameters():
                 p.requires_grad = i >= freeze_blocks
 
     def train(self, mode=True):
         super().train(mode)
-        if mode:
+        # LayerNorm holds no running statistics, so a ViT backbone needs no
+        # eval pinning -- only the CNN path can drift BatchNorm stats.
+        if mode and not self.backbone_is_vit:
             for i, block in enumerate(self.raw_backbone()):
                 if i < self.freeze_blocks:
                     block.eval()
         return self
 
-    def backbone_param_groups(self, lr_backbone, llrd=0.75):
-        """Layer-wise LR decay: later, more task-specific blocks get the full
-        LR; earlier blocks progressively less.  The main guard against the
-        backbone collapsing onto identity cues on a small corpus."""
+    def backbone_param_groups(self, lr_backbone, llrd=0.75, lr_ln=None):
+        """CNN: layer-wise LR decay -- later, more task-specific blocks get
+        the full LR; earlier blocks progressively less.  The main guard
+        against the backbone collapsing onto identity cues on a small corpus.
+
+        ViT: one group holding every LayerNorm parameter at `lr_ln`.  There
+        are no blocks to decay across, and LR_BACKBONE (1e-5, tuned for
+        full-backbone EfficientNet fine-tuning) is roughly an order of
+        magnitude too low to move so few parameters -- hence the separate
+        knob rather than reusing lr_backbone.
+        """
         raw = self.raw_backbone()
+        if self.backbone_is_vit:
+            params = [p for p in raw.parameters() if p.requires_grad]
+            return [{"params": params, "lr": lr_ln if lr_ln is not None else lr_backbone}] \
+                if params else []
         groups, n = [], len(raw)
         for i in range(self.freeze_blocks, n):
             params = [p for p in raw[i].parameters() if p.requires_grad]
@@ -744,21 +1242,54 @@ class CrossFuseModelV5(nn.Module):
     def encode_visual(self, crops):
         """crops: (B,T,S,S,3) uint8 -> (v_tok, m_tok), each (B,T,backbone_dim).
 
-        v_tok is the 3x3 grid mean (global token); m_tok is the BOTTOM ROW of
-        the grid, which is where the mouth sits in a margin-expanded face
-        crop.  Deterministic -- the backbone holds no Dropout, so MC-Dropout
-        never re-runs it."""
-        B, T = crops.shape[0], crops.shape[1]
+        v_tok is the shared backbone's 3x3 grid mean (global token). m_tok
+        comes from a SEPARATE dedicated CNN (self.mouth_encoder) run on a
+        cropped mouth region taken directly from the raw crop, before the
+        whole-face resize -- see MOUTH_BOX_FRACS. Deterministic -- neither
+        network holds Dropout on this path, so MC-Dropout never re-runs it."""
+        B, T, S = crops.shape[0], crops.shape[1], crops.shape[2]
         x = crops.reshape(B * T, *crops.shape[2:])
-        x = x.permute(0, 3, 1, 2).float().div_(255.0)
-        if x.shape[-1] != self.train_res:
-            x = F.interpolate(x, size=(self.train_res, self.train_res),
-                              mode="bilinear", align_corners=False)
-        x = (x - self.img_mean) / self.img_std
-        grid = self.spatial_pool(self.backbone(x))
-        v_tok = grid.mean(dim=(2, 3)).view(B, T, self.backbone_dim)
-        m_tok = grid[:, :, 2, :].mean(dim=2).view(B, T, self.backbone_dim)
+
+        m_tok = None
+        if self.use_sync_head:
+            r0f, r1f, c0f, c1f = self.mouth_box_fracs
+            r0, r1 = int(r0f * S), int(r1f * S)
+            c0, c1 = int(c0f * S), int(c1f * S)
+            # Sliced from `crops`, not the flattened `x`, so the T axis
+            # survives -- MouthEncoder's temporal conv stack needs it.
+            mouth = crops[:, :, r0:r1, c0:c1, :]
+            m_tok = self.mouth_encoder(mouth)
+
+        v_tok = encode_frames(self.backbone, x, self.img_mean, self.img_std,
+                              self.train_res, self.backbone_is_vit,
+                              self.spatial_pool).view(B, T, self.backbone_dim)
         return v_tok, m_tok
+
+    def _sync_offset_profile(self, m_tok, sync_audio, visual_mask):
+        """Cosine-similarity profile between mouth tokens and audio tokens at
+        every relative offset k in [-sync_max_offset, sync_max_offset].
+
+        `sync_audio` is the WIDENED mel slice CrossFuseCropDataset builds for
+        this arch -- it covers [t0 - K/fps, t1 + K/fps] and is encoded here to
+        exactly W + 2K timesteps, so audio index (t + K + k) lines up with
+        mouth/video frame t offset by k frames. A time-ALIGNED window's
+        profile should peak at k=0 by construction of that slice; a genuinely
+        offset window's should not -- and unlike the old pooled-attention
+        path, this computation is NOT invariant to shuffling the audio
+        timesteps, because each similarity is tied to a specific (t, k) pair
+        before any pooling happens.
+
+        Returns (sync_logit, profile); profile is exposed separately so the
+        training loop can add an InfoNCE loss against it and so the probe
+        notebook can plot it directly.
+        """
+        K = self.sync_max_offset
+        M = F.normalize(self.sync_mouth_emb(self.mouth_proj(m_tok)), dim=-1)   # (B, W, E)
+        A_enc = self.offset_audio_encoder(sync_audio)                          # (B, W+2K, hidden)
+        A = F.normalize(self.sync_audio_emb(A_enc), dim=-1)                    # (B, W+2K, E)
+        profile = offset_similarity_profile(M, A, visual_mask, K)
+        sync_logit = self.sync_head(profile).squeeze(-1)
+        return sync_logit, profile
 
     def forward_from_tokens(self, v_tok, m_tok, mfcc, sync_audio=None, visual_mask=None):
         B, T = v_tok.shape[0], v_tok.shape[1]
@@ -776,19 +1307,45 @@ class CrossFuseModelV5(nn.Module):
         a_rep = masked_mean_std(A_enc, None)
         audio_logit = self.audio_head(a_rep).squeeze(-1)
 
-        sync_logit = fusion_logit = attn_v2a = attn_a2v = None
+        sync_logit = fusion_logit = attn_v2a = attn_a2v = sync_profile = None
 
         if self.use_sync_head and sync_audio is not None:
-            M = self.mouth_proj(m_tok)
-            S_enc = self.mel_encoder(sync_audio)
-            ca_m, _ = self.sync_ca_m2a(query=M, key=S_enc, value=S_enc)
-            fused_m = self.sync_ln_m(M + ca_m)
-            ca_a, _ = self.sync_ca_a2m(query=S_enc, key=M, value=M,
-                                       key_padding_mask=key_padding_mask)
-            fused_s = self.sync_ln_a(S_enc + ca_a)
-            sync_logit = self.sync_head(torch.cat(
-                [masked_mean_std(fused_m, visual_mask),
-                 masked_mean_std(fused_s, None)], dim=-1)).squeeze(-1)
+            if self.sync_arch == "offset_profile":
+                sync_logit, sync_profile = self._sync_offset_profile(
+                    m_tok, sync_audio, visual_mask)
+            else:
+                # UNCHANGED from the original branch, deliberately -- this is
+                # what produced the reported 0.5074 AUC and the exactly-0.500
+                # A10_sync_unaligned result, and both need to stay
+                # byte-for-byte reproducible from this repo.
+                #
+                # Everything from S_enc onward is exactly invariant to any
+                # permutation of S_enc's own T positions: sync_ca_m2a pools
+                # over the {S_enc} key/value SET (order-blind), sync_ca_a2m's
+                # per-position queries against the fixed M set are pointwise
+                # (permuting S_enc just permutes its output in lockstep), and
+                # masked_mean_std pools both arms over time before the
+                # classifier. No positional signal enters any of that. So
+                # once mel_encoder has produced a set of T local-content
+                # vectors, sync_logit cannot depend on WHICH temporal
+                # position each one came from relative to the mouth sequence
+                # -- only on the order-blind pooled SET of content. (Note:
+                # this is NOT invariance to permuting the raw sync_audio mel
+                # bins -- mel_encoder is a CNN and its local receptive fields
+                # make that a genuinely different encoding, not a relabelling
+                # of the same one. The provable claim is one step later, at
+                # S_enc.) That's the root cause the offset_profile arch above
+                # exists to fix; see CONFIG["SYNC_ARCH"].
+                M = self.mouth_proj(m_tok)
+                S_enc = self.mel_encoder(sync_audio)
+                ca_m, _ = self.sync_ca_m2a(query=M, key=S_enc, value=S_enc)
+                fused_m = self.sync_ln_m(M + ca_m)
+                ca_a, _ = self.sync_ca_a2m(query=S_enc, key=M, value=M,
+                                           key_padding_mask=key_padding_mask)
+                fused_s = self.sync_ln_a(S_enc + ca_a)
+                sync_logit = self.sync_head(torch.cat(
+                    [masked_mean_std(fused_m, visual_mask),
+                     masked_mean_std(fused_s, None)], dim=-1)).squeeze(-1)
 
         if self.use_fusion_head:
             if self.use_cross_attention and not self.late_fusion_baseline:
@@ -805,7 +1362,8 @@ class CrossFuseModelV5(nn.Module):
 
         return {"video_logit": video_logit, "frame_logits": frame_logits,
                 "audio_logit": audio_logit, "sync_logit": sync_logit,
-                "fusion_logit": fusion_logit, "attn_v2a": attn_v2a, "attn_a2v": attn_a2v}
+                "fusion_logit": fusion_logit, "attn_v2a": attn_v2a, "attn_a2v": attn_a2v,
+                "sync_profile": sync_profile}
 
     def forward(self, crops, mfcc, sync_audio=None, visual_mask=None):
         v_tok, m_tok = self.encode_visual(crops)
@@ -815,6 +1373,28 @@ class CrossFuseModelV5(nn.Module):
 def build_model(cfg, pretrained=True):
     """Single construction path shared by every notebook, so an ablation
     checkpoint always loads into the architecture it was trained as."""
+    if cfg["BACKBONE"] in _CLIP_BACKBONES and cfg["FREEZE_BLOCKS"] != 0:
+        # Raise rather than coerce: FREEZE_BLOCKS >= 1 on a ViT means "never
+        # train the backbone at all", so a config carried over from an
+        # EfficientNet row would silently run LN-tuning with zero trainable
+        # LayerNorms and merely look like a disappointing result.
+        raise ValueError(
+            f"BACKBONE='{cfg['BACKBONE']}' uses LN-tuning and requires "
+            f"FREEZE_BLOCKS=0 (got {cfg['FREEZE_BLOCKS']}). FREEZE_BLOCKS is a "
+            f"CNN block depth; on a ViT any value >= 1 freezes the whole "
+            f"backbone. Set FREEZE_BLOCKS=4 only on the efficientnet_* rows.")
+    sync_arch = cfg.get("SYNC_ARCH", "offset_profile")
+    if not cfg["SYNC_DENSE_ALIGNED"] and sync_arch != "pooled_ca":
+        # A10_sync_unaligned and any other SYNC_DENSE_ALIGNED=False row has no
+        # time base for an offset profile to be computed over -- see
+        # CrossFuseModelV5.__init__'s matching assertion. Raise here too, at
+        # the single construction path, so this is caught before a training
+        # run rather than inside the first forward pass.
+        raise ValueError(
+            f"SYNC_DENSE_ALIGNED=False requires SYNC_ARCH='pooled_ca' (got "
+            f"'{sync_arch}'); the offset-profile head has no time base to "
+            f"work with once the mel slice loses its alignment to the video "
+            f"window.")
     return CrossFuseModelV5(
         window_frames=cfg["WINDOW_FRAMES"], n_mels=cfg["N_MELS"],
         backbone=cfg["BACKBONE"], train_res=cfg["TRAIN_RES"],
@@ -822,7 +1402,11 @@ def build_model(cfg, pretrained=True):
         use_sync_head=cfg["USE_SYNC_HEAD"], use_fusion_head=cfg["USE_FUSION_HEAD"],
         late_fusion_baseline=cfg["LATE_FUSION_BASELINE"],
         sync_dense_aligned=cfg["SYNC_DENSE_ALIGNED"],
-        freeze_blocks=cfg["FREEZE_BLOCKS"], pretrained=pretrained)
+        freeze_blocks=cfg["FREEZE_BLOCKS"], pretrained=pretrained,
+        mouth_box_fracs=cfg["MOUTH_BOX_FRACS"],
+        grad_checkpointing=cfg.get("GRAD_CHECKPOINTING", True),
+        sync_arch=sync_arch, sync_max_offset=cfg.get("SYNC_MAX_OFFSET", 8),
+        sync_emb_dim=cfg.get("SYNC_EMB_DIM", 128))
 
 
 def portable_state_dict(model):
@@ -845,15 +1429,15 @@ def load_portable_state_dict(model, state):
 
 
 def load_visual_encoder(model, ckpt_path, verbose=True):
-    """Load an SBI-pretrained `backbone.*` state dict into a CrossFuseModelV5.
+    """Load a pretrained `backbone.*` state dict into a CrossFuseModelV5.
 
-    The checkpoint from the FF++/SBI stage stores the backbone under
+    The checkpoint from the FF++ pretraining stage stores the backbone under
     'backbone_state'.  Nothing else is transferred -- the multimodal heads
     have no counterpart there and must train from scratch.
 
     Raises rather than warns on a shape mismatch: silently falling back to
-    ImageNet weights would make the SBI ablation row meaningless while still
-    appearing to run."""
+    ImageNet/CLIP-default weights would make the pretraining ablation row
+    meaningless while still appearing to run."""
     if ckpt_path is None:
         return model
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -861,12 +1445,12 @@ def load_visual_encoder(model, ckpt_path, verbose=True):
     missing, unexpected = model.raw_backbone().load_state_dict(state, strict=False)
     if missing:
         raise RuntimeError(
-            f"SBI encoder does not fit this backbone ({len(missing)} missing keys, "
-            f"e.g. {missing[:3]}). Check that CONFIG['BACKBONE'] matches the "
-            f"backbone the SBI stage was trained with.")
+            f"Pretrained encoder does not fit this backbone ({len(missing)} missing "
+            f"keys, e.g. {missing[:3]}). Check that CONFIG['BACKBONE'] matches the "
+            f"backbone the pretraining stage was trained with.")
     if verbose:
         n = sum(p.numel() for p in model.backbone.parameters())
-        print(f"  Loaded SBI-pretrained visual encoder from {ckpt_path} "
+        print(f"  Loaded pretrained visual encoder from {ckpt_path} "
               f"({n:,} params, {len(unexpected)} unexpected keys ignored)")
     return model
 
@@ -1044,14 +1628,43 @@ class CrossFuseCropDataset(Dataset):
         self.sr = cfg["AUDIO_SR"]
         self.group_to_id = {g: i for i, g in
                             enumerate(sorted({r["identity_group"] for r in rows}))}
+        # offset_profile needs a WIDER mel slice than [t0, t1] -- it scores
+        # SYNC_MAX_OFFSET frames of context on either side -- so both the
+        # real-time padding and the resampled length depend on SYNC_ARCH.
+        # pooled_ca reduces this to exactly the original SYNC_MEL_FRAMES
+        # slice with zero padding (sync_offset_pad=0 below is a no-op).
+        self.sync_arch = cfg.get("SYNC_ARCH", "offset_profile")
+        self.sync_offset_pad = (cfg.get("SYNC_MAX_OFFSET", 8)
+                                if self.sync_arch == "offset_profile" else 0)
+        self.sync_frames = (self.W + 2 * self.sync_offset_pad
+                            if self.sync_arch == "offset_profile"
+                            else cfg["SYNC_MEL_FRAMES"])
 
     def __len__(self):
         return len(self.indices)
 
     def _load(self, ridx):
+        """(row, crops, mfcc, mel, valid, timestamps).
+
+        Rows may come from EITHER corpus.  FakeAVCeleb rows carry a
+        `_meta.npz` sidecar with cached audio features; FF++ rows are
+        visual-only and carry none, so their audio tensors are synthesised
+        as zeros here and masked out of every audio-dependent loss by the
+        `has_audio` flag.  `crop_dir` is read per-row so the two caches can
+        live in separate Kaggle datasets.
+        """
         r = self.rows[ridx]
-        base = os.path.join(self.crop_dir, r["key"])
+        base = os.path.join(r.get("crop_dir") or self.crop_dir, r["key"])
         crops = np.load(base + ".npy", mmap_mode="r")
+
+        if not int(r.get("has_audio", 1)):
+            n = crops.shape[0]
+            return (r, crops,
+                    np.zeros((40, self.cfg["AUDIO_FRAMES"]), np.float32),
+                    np.zeros((self.cfg["N_MELS"], self.cfg["SYNC_MEL_FRAMES"]), np.float32),
+                    np.ones(n, dtype=bool),
+                    (np.arange(n, dtype=np.float32) / 25.0))
+
         meta = np.load(base + "_meta.npz")
         # Stage A caches BOTH MFCC variants so AUDIO_LEAD_SKIP is a free
         # config flip rather than a re-extraction.
@@ -1095,18 +1708,32 @@ class CrossFuseCropDataset(Dataset):
         if not win_valid.any():
             win_valid[0] = True
 
-        mfcc = maybe_cmvn(mfcc_raw, use_cmvn=self.cfg["USE_MFCC_CMVN"])
+        has_audio = int(r.get("has_audio", 1))
+        # CMVN on an all-zero MFCC divides by a zero std.  maybe_cmvn's eps
+        # keeps it finite, but the result is still meaningless, so skip it
+        # and leave the tensor exactly zero for the masked path.
+        mfcc = (maybe_cmvn(mfcc_raw, use_cmvn=self.cfg["USE_MFCC_CMVN"])
+                if has_audio else mfcc_raw.astype(np.float32))
 
-        if self.cfg["SYNC_DENSE_ALIGNED"]:
-            sync_a = slice_logmel_window(mel_full, t0, t1, self.cfg["SYNC_MEL_FRAMES"])
+        if not has_audio:
+            z = np.zeros((self.cfg["N_MELS"], self.sync_frames), np.float32)
+            sync_a, sync_off = z, z.copy()
+        elif self.cfg["SYNC_DENSE_ALIGNED"]:
+            # pad_s == 0 for SYNC_ARCH="pooled_ca" (sync_offset_pad is 0
+            # there), so this is exactly the original [t0, t1] slice in that
+            # case. offset_profile widens both ends by SYNC_MAX_OFFSET frames
+            # so the model has audio context to score every offset k against
+            # -- read from the ALREADY-CACHED full-clip mel, no re-extraction.
+            pad_s = self.sync_offset_pad / fps
+            sync_a = slice_logmel_window(mel_full, t0 - pad_s, t1 + pad_s, self.sync_frames)
             # SyncNet-style hard negative: same clip, same speaker, same
             # recording conditions -- ONLY the time offset differs, so the
             # only way to tell it apart is actual lip-sync.
             dur = mel_full.shape[1] / LOGMEL_FPS
             shift = rng.choice([-1, 1]) * rng.uniform(0.4, max(0.5, dur / 3))
             o0 = float(np.clip(t0 + shift, 0.0, max(0.0, dur - (t1 - t0))))
-            sync_off = slice_logmel_window(mel_full, o0, o0 + (t1 - t0),
-                                           self.cfg["SYNC_MEL_FRAMES"])
+            sync_off = slice_logmel_window(mel_full, o0 - pad_s, o0 + (t1 - t0) + pad_s,
+                                           self.sync_frames)
         else:
             # Ablation: the v3.3 arrangement -- whole-clip MFCC against a
             # visual window it has no time correspondence with.
@@ -1125,7 +1752,8 @@ class CrossFuseCropDataset(Dataset):
                 torch.from_numpy(sync_off),
                 torch.tensor(float(v_label)), torch.tensor(float(a_label)),
                 torch.from_numpy(win_valid),
-                torch.tensor(self.group_to_id[r["identity_group"]], dtype=torch.long))
+                torch.tensor(self.group_to_id[r["identity_group"]], dtype=torch.long),
+                torch.tensor(float(has_audio)))
 
 
 class PairedBatchSampler(Sampler):
@@ -1204,6 +1832,62 @@ def worker_init_fn(worker_id):
 # Splitting
 # =====================================================================
 
+def merge_manifests(fav_rows, fav_crop_dir, ffpp_rows, ffpp_crop_dir,
+                    ffpp_frac=1.0, seed=42, verbose=True):
+    """One manifest spanning FakeAVCeleb and FF++, for joint visual training.
+
+    FakeAVCeleb alone is ~97% Wav2Lip -- a mouth-region reenactment -- so a
+    video head trained only on it never sees a full-face swap and cannot
+    transfer to Celeb-DF or DFDC.  Adding FF++'s four swap families to the
+    SAME training mixture is the direct fix; keeping FakeAVCeleb in the
+    mixture is what preserves the audio, sync and fusion heads, which have
+    no FF++ counterpart.
+
+    FF++ rows are tagged `has_audio=0`.  Every audio-dependent loss and
+    metric masks on that flag, so those rows train the visual branch only.
+    Identity groups are namespaced per corpus so the split cannot
+    accidentally union an FF++ id with a FakeAVCeleb one.
+    """
+    rng = random.Random(seed)
+    out = []
+    for r in fav_rows:
+        r = dict(r)
+        r["crop_dir"] = fav_crop_dir
+        r["has_audio"] = 1
+        r["identity_group"] = f"fav::{r['identity_group']}"
+        r["corpus"] = "fakeavceleb"
+        out.append(r)
+
+    ff = list(ffpp_rows)
+    rng.shuffle(ff)
+    if ffpp_frac < 1.0:
+        ff = ff[:int(round(len(ff) * ffpp_frac))]
+    for r in ff:
+        out.append({
+            "key": r["key"], "path": r["path"], "crop_dir": ffpp_crop_dir,
+            "category": f"FFPP-{r['method']}",
+            "identity_group": f"ffpp::{r['identity_group']}",
+            "video_label": int(r["label"]),
+            # Never read: has_audio=0 masks every audio-dependent term.
+            "audio_label": 0,
+            "has_audio": 0, "corpus": "ffpp",
+            # FF++ is auxiliary TRAINING signal only -- see
+            # build_3way_split_packed for why it must not reach val/test.
+            "train_only": 1,
+            "n_valid_faces": 0, "fps": 25.0,
+        })
+
+    if verbose:
+        n_fav = sum(1 for r in out if r["corpus"] == "fakeavceleb")
+        n_ff = len(out) - n_fav
+        v_fake = sum(r["video_label"] for r in out)
+        print(f"Merged manifest: {len(out)} rows "
+              f"({n_fav} FakeAVCeleb + {n_ff} FF++) | "
+              f"video real/fake {len(out) - v_fake}/{v_fake} | "
+              f"{n_fav} rows carry audio")
+    return out
+
+
 def build_3way_split_packed(rows, identity_disjoint=True, fracs=(0.60, 0.20, 0.20),
                             seed=42, verbose=True):
     """Train/val/test indices targeting `fracs` by SAMPLE count, not group
@@ -1213,9 +1897,16 @@ def build_3way_split_packed(rows, identity_disjoint=True, fracs=(0.60, 0.20, 0.2
     With identity_disjoint=True no identity group appears in more than one
     partition, and an assertion enforces it.  identity_disjoint=False is the
     leakage ablation and reproduces the naive per-clip random split.
+
+    Rows carrying `train_only` (FF++ rows from `merge_manifests`) are pinned
+    to train and excluded from the packing entirely.  FF++ is auxiliary
+    TRAINING signal: letting it into val/test would make the in-domain video
+    AUC a blend of two corpora and no longer comparable to the FakeAVCeleb
+    numbers the rest of the project reports.
     """
     rng = random.Random(seed)
-    idx_all = list(range(len(rows)))
+    pinned = [i for i, r in enumerate(rows) if r.get("train_only")]
+    idx_all = [i for i in range(len(rows)) if not rows[i].get("train_only")]
     if not identity_disjoint:
         rng.shuffle(idx_all)
         n = len(idx_all)
@@ -1247,6 +1938,8 @@ def build_3way_split_packed(rows, identity_disjoint=True, fracs=(0.60, 0.20, 0.2
         assert not (g_tr & g_te), f"Identity leak train/test: {sorted(g_tr & g_te)[:5]}"
         assert not (g_va & g_te), f"Identity leak val/test: {sorted(g_va & g_te)[:5]}"
 
+    tr = list(tr) + pinned
+
     if verbose:
         def _summary(name, ids):
             vf = sum(int(rows[i]["video_label"]) for i in ids)
@@ -1258,6 +1951,10 @@ def build_3way_split_packed(rows, identity_disjoint=True, fracs=(0.60, 0.20, 0.2
         _summary("train", tr)
         _summary("val  ", va)
         _summary("test ", te)
+        if pinned:
+            print(f"    ({len(pinned)} train_only rows pinned to train; "
+                  f"val/test stay single-corpus so their AUCs remain "
+                  f"comparable to the FakeAVCeleb-only baseline)")
     return np.array(tr), np.array(va), np.array(te)
 
 
@@ -1478,7 +2175,7 @@ def evaluate_deterministic(model_local, loader, cfg):
     acc = defaultdict(list)
     with torch.no_grad():
         for batch in loader:
-            crops, mfcc, sync_a, sync_off, vlab, alab, mask, _gid = [
+            crops, mfcc, sync_a, sync_off, vlab, alab, mask, _gid, has_a = [
                 b.to(device, non_blocking=True) for b in batch]
             with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
                 # One backbone pass per batch.  The sync head's negative needs
@@ -1490,24 +2187,50 @@ def evaluate_deterministic(model_local, loader, cfg):
                 out = m.forward_from_tokens(v_tok, m_tok, mfcc, sync_a, visual_mask=mask)
                 out_neg = (m.forward_from_tokens(v_tok, m_tok, mfcc, sync_off, visual_mask=mask)
                            if out["sync_logit"] is not None else None)
+            # The video head is scored on every row; the audio/sync/fusion
+            # heads only on rows that actually HAVE audio.  A merged manifest
+            # carries visual-only FF++ rows whose audio tensors are zeros, and
+            # letting those into the audio AUC would score the model on
+            # labels it was never given evidence for.
+            keep = has_a.bool().cpu().numpy()
             acc["v_prob"].extend(torch.sigmoid(out["video_logit"].float()).cpu().numpy())
             acc["v_true"].extend(vlab.cpu().numpy())
-            acc["a_prob"].extend(torch.sigmoid(out["audio_logit"].float()).cpu().numpy())
-            acc["a_true"].extend(alab.cpu().numpy())
+            acc["a_prob"].extend(torch.sigmoid(out["audio_logit"].float()).cpu().numpy()[keep])
+            acc["a_true"].extend(alab.cpu().numpy()[keep])
             if out["fusion_logit"] is not None:
-                acc["f_prob"].extend(torch.sigmoid(out["fusion_logit"].float()).cpu().numpy())
-                acc["f_true"].extend(torch.clamp(vlab + alab, 0, 1).cpu().numpy())
+                acc["f_prob"].extend(
+                    torch.sigmoid(out["fusion_logit"].float()).cpu().numpy()[keep])
+                acc["f_true"].extend(
+                    torch.clamp(vlab + alab, 0, 1).cpu().numpy()[keep])
             if out_neg is not None:
                 # Matched window scores 0; the time-shifted negative scores 1.
-                acc["s_prob"].extend(torch.sigmoid(out["sync_logit"].float()).cpu().numpy())
-                acc["s_true"].extend([0] * crops.size(0))
-                acc["s_prob"].extend(torch.sigmoid(out_neg["sync_logit"].float()).cpu().numpy())
-                acc["s_true"].extend([1] * crops.size(0))
+                n_keep = int(keep.sum())
+                acc["s_prob"].extend(
+                    torch.sigmoid(out["sync_logit"].float()).cpu().numpy()[keep])
+                acc["s_true"].extend([0] * n_keep)
+                acc["s_prob"].extend(
+                    torch.sigmoid(out_neg["sync_logit"].float()).cpu().numpy()[keep])
+                acc["s_true"].extend([1] * n_keep)
     return {"video_auc": safe_auc(acc["v_true"], acc["v_prob"]),
             "audio_auc": safe_auc(acc["a_true"], acc["a_prob"]),
             "sync_auc": safe_auc(acc["s_true"], acc["s_prob"]) if acc["s_true"] else float("nan"),
             "fusion_auc": safe_auc(acc["f_true"], acc["f_prob"]) if acc["f_true"] else float("nan"),
             "raw": dict(acc)}
+
+
+def should_stop(since_best, patience, phase, elapsed_s, budget_s):
+    """Why training should stop now, or None to keep going.
+
+    Patience only counts in the fine-tune phase (phase == 1), matching the
+    old inline check. The time budget applies in every phase: it exists so a
+    run ends cleanly, with its best checkpoint already on disk, instead of
+    being killed by Kaggle's 9h session cap mid-epoch.
+    """
+    if budget_s is not None and elapsed_s >= budget_s:
+        return "time_budget"
+    if phase == 1 and since_best >= patience:
+        return "patience"
+    return None
 
 
 def run_training_pipeline(manifest, crop_dir, cfg, tag="main", seed=None, verbose=True):
@@ -1542,8 +2265,11 @@ def run_training_pipeline(manifest, crop_dir, cfg, tag="main", seed=None, verbos
     val_loader = DataLoader(val_ds, batch_size=cfg["BATCH_CLIPS"], shuffle=False, **common)
     test_loader = DataLoader(test_ds, batch_size=cfg["BATCH_CLIPS"], shuffle=False, **common)
 
-    model_local = build_model(cfg).to(device)
-    load_visual_encoder(model_local, cfg.get("SBI_PRETRAINED_ENCODER"), verbose=verbose)
+    # PRETRAINED_BACKBONE=False is the control arm for "how much of the result
+    # is CLIP's pretraining rather than our supervision", and lets the whole
+    # pipeline be exercised without a 1.7 GB download.
+    model_local = build_model(cfg, pretrained=cfg.get("PRETRAINED_BACKBONE", True)).to(device)
+    load_visual_encoder(model_local, cfg.get("PRETRAINED_ENCODER"), verbose=verbose)
     if cfg.get("MULTI_GPU", False):
         n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
         if n_gpu > 1:
@@ -1564,6 +2290,9 @@ def run_training_pipeline(manifest, crop_dir, cfg, tag="main", seed=None, verbos
     crit_video = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     crit_frame = nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction="none")
     crit_plain = nn.BCEWithLogitsLoss()
+    # Unreduced, so the audio/sync/fusion losses can be averaged over only
+    # the rows that carry audio (see the has_audio masking in the step loop).
+    crit_none = nn.BCEWithLogitsLoss(reduction="none")
 
     total_epochs = cfg["EPOCHS_FROZEN"] + cfg["EPOCHS_FINETUNE"]
     scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
@@ -1572,13 +2301,14 @@ def run_training_pipeline(manifest, crop_dir, cfg, tag="main", seed=None, verbos
 
     def make_optim(phase):
         if phase == 0:
-            model_local.set_backbone_trainable(len(model_local.raw_backbone()))
+            model_local.set_backbone_trainable(model_local.n_backbone_blocks())
             groups = [{"params": [p for n_, p in model_local.named_parameters()
                                   if p.requires_grad and not n_.startswith("backbone")],
                        "lr": cfg["LR_HEAD"] * 10}]
         else:
             model_local.set_backbone_trainable(cfg["FREEZE_BLOCKS"])
-            groups = model_local.backbone_param_groups(cfg["LR_BACKBONE"], cfg["LLRD"])
+            groups = model_local.backbone_param_groups(
+                cfg["LR_BACKBONE"], cfg["LLRD"], lr_ln=cfg.get("LR_LN"))
             groups.append({"params": [p for n_, p in model_local.named_parameters()
                                       if p.requires_grad and not n_.startswith("backbone")],
                            "lr": cfg["LR_HEAD"]})
@@ -1589,6 +2319,8 @@ def run_training_pipeline(manifest, crop_dir, cfg, tag="main", seed=None, verbos
             "sync": float("nan"), "fusion": float("nan"), "train_video": float("nan"),
             "train_sync": float("nan")}
     since_best = 0
+    t_run_start = time.time()
+    stop_reason = None   # None = ran every scheduled epoch; else "patience" / "time_budget"
 
     if verbose:
         print(f"  [{tag}] modality={modality} CA={cfg['USE_CROSS_ATTENTION']} "
@@ -1622,9 +2354,10 @@ def run_training_pipeline(manifest, crop_dir, cfg, tag="main", seed=None, verbos
         run_loss, nb = 0.0, 0
         tr = defaultdict(list)
         optimizer.zero_grad(set_to_none=True)
+        sync_neg_source = Counter()
 
         for step, batch in enumerate(train_loader):
-            crops, mfcc, sync_a, sync_off, vlab, alab, mask, gid = [
+            crops, mfcc, sync_a, sync_off, vlab, alab, mask, gid, has_a = [
                 b.to(device, non_blocking=True) for b in batch]
             with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
                 # encode_visual ONCE; the sync loss needs a second HEAD pass
@@ -1645,26 +2378,67 @@ def run_training_pipeline(manifest, crop_dir, cfg, tag="main", seed=None, verbos
                     mf = mask.float()
                     loss = loss + cfg["LAMBDA_FRAME"] * (
                         (fl * mf).sum() / mf.sum().clamp(min=1.0))
+                # A merged FakeAVCeleb + FF++ manifest carries visual-only
+                # rows whose audio tensors are zeros.  Every audio-dependent
+                # loss is masked to rows that HAVE audio, so those zeros never
+                # become a fifth "silence => real audio" class.  With a
+                # FakeAVCeleb-only manifest has_a is all ones and this reduces
+                # exactly to the previous behaviour.
+                n_a = has_a.sum().clamp(min=1.0)
                 if modality in ("both", "audio_only"):
-                    loss = loss + crit_plain(out["audio_logit"], alab)
+                    la = crit_none(out["audio_logit"], alab)
+                    loss = loss + (la * has_a).sum() / n_a
 
                 if out["fusion_logit"] is not None and modality == "both":
                     any_lab = torch.clamp(vlab + alab, 0, 1)
-                    loss = loss + cfg["LAMBDA_FUSION"] * crit_plain(out["fusion_logit"], any_lab)
+                    lf = crit_none(out["fusion_logit"], any_lab)
+                    loss = loss + cfg["LAMBDA_FUSION"] * ((lf * has_a).sum() / n_a)
 
                 if out["sync_logit"] is not None and modality == "both":
                     B = crops.size(0)
                     perm = torch.randperm(B, device=device)
                     ok = gid[perm] != gid            # negative 1: another identity
+                    if epoch == 0:
+                        n_ok = int(ok.sum())
+                        sync_neg_source["cross_identity"] += n_ok
+                        sync_neg_source["same_clip_shift"] += B - n_ok
                     neg_a = torch.where(ok.view(-1, 1, 1), sync_a[perm], sync_off)
                     out_neg = model_local.forward_from_tokens(v_tok, m_tok, mfcc, neg_a,
                                                              visual_mask=mask)
                     s_logit = torch.cat([out["sync_logit"], out_neg["sync_logit"]], 0)
                     s_lab = torch.cat([torch.zeros(B, device=device),
                                        torch.ones(B, device=device)], 0)
-                    loss = loss + cfg["LAMBDA_SYNC"] * crit_plain(s_logit, s_lab)
-                    tr["s_prob"].extend(torch.sigmoid(s_logit.detach().float()).cpu().numpy())
-                    tr["s_true"].extend([0] * B + [1] * B)
+                    # A silent row's "matched" and "shifted" mel are the same
+                    # zeros, so it carries no sync label at all -- mask both
+                    # halves rather than teach the head to guess on silence.
+                    s_w = torch.cat([has_a, has_a], 0)
+                    ls = crit_none(s_logit, s_lab)
+                    loss = loss + cfg["LAMBDA_SYNC"] * (
+                        (ls * s_w).sum() / s_w.sum().clamp(min=1.0))
+
+                    if (cfg.get("SYNC_ARCH", "offset_profile") == "offset_profile"
+                            and out["sync_profile"] is not None):
+                        # InfoNCE over the offset profile: a MATCHED window's
+                        # mel slice is built around exactly [t0, t1] (see
+                        # CrossFuseCropDataset), so offset k=0 (profile index
+                        # SYNC_MAX_OFFSET) is the correct alignment by
+                        # construction -- dense, per-clip supervision, unlike
+                        # the one bit per clip the BCE loss above provides.
+                        # Positive pass only: out_neg's audio has no known
+                        # true alignment to train a peak-location target
+                        # against (a cross-identity negative has none at all;
+                        # a same-clip shift's true offset isn't tracked).
+                        K = cfg["SYNC_MAX_OFFSET"]
+                        nce_target = torch.full((B,), K, dtype=torch.long, device=device)
+                        nce = F.cross_entropy(out["sync_profile"] / cfg["SYNC_NCE_TEMP"],
+                                             nce_target, reduction="none")
+                        loss = loss + cfg["LAMBDA_SYNC_NCE"] * (
+                            (nce * has_a).sum() / n_a)
+
+                    keep_s = has_a.detach().bool().cpu().numpy()
+                    sp = torch.sigmoid(s_logit.detach().float()).cpu().numpy()
+                    tr["s_prob"].extend(sp[:B][keep_s]); tr["s_true"].extend([0] * int(keep_s.sum()))
+                    tr["s_prob"].extend(sp[B:][keep_s]); tr["s_true"].extend([1] * int(keep_s.sum()))
 
             scaler.scale(loss / cfg["GRAD_ACCUM"]).backward()
             if (step + 1) % cfg["GRAD_ACCUM"] == 0:
@@ -1682,6 +2456,17 @@ def run_training_pipeline(manifest, crop_dir, cfg, tag="main", seed=None, verbos
         val = evaluate_deterministic(model_local, val_loader, cfg)
         train_video_auc = safe_auc(tr["v_true"], tr["v_prob"])
         train_sync_auc = safe_auc(tr["s_true"], tr["s_prob"]) if tr["s_true"] else float("nan")
+
+        if epoch == 0 and sum(sync_neg_source.values()) > 0:
+            total_neg = sum(sync_neg_source.values())
+            ci_frac = sync_neg_source["cross_identity"] / total_neg
+            print(f"[{tag}] sync negative source, epoch 1 train pass "
+                  f"({total_neg} negatives): cross_identity={ci_frac:.1%} "
+                  f"same_clip_shift={1 - ci_frac:.1%}. If same_clip_shift "
+                  f"dominates, the model is mostly being asked to solve fine-"
+                  f"grained lip-sync timing (hard); if cross_identity "
+                  f"dominates, chance-level AUC despite that points at a "
+                  f"different bug, not a hard-task ceiling.")
 
         if modality == "video_only":
             mean_auc = val["video_auc"]
@@ -1714,10 +2499,26 @@ def run_training_pipeline(manifest, crop_dir, cfg, tag="main", seed=None, verbos
                   f"gap {train_video_auc - val['video_auc']:+.4f}"
                   f"{' * (New Best)' if improved else ''}")
 
-        if since_best >= cfg["PATIENCE"] and phase == 1:
+        stop_reason = should_stop(since_best, cfg["PATIENCE"], phase,
+                                  time.time() - t_run_start, cfg.get("TIME_BUDGET_S"))
+        if stop_reason:
             if verbose:
-                print(f"  [{tag}] Early stopping at epoch {epoch + 1}.")
+                print(f"  [{tag}] Stopping at epoch {epoch + 1}: {stop_reason}.")
             break
+
+    if best["epoch"] < 0:
+        # No epoch ever improved, so nothing was ever written.  The usual
+        # cause is a val split carrying a single class for the selection
+        # heads, which makes mean_auc NaN and every comparison False.  Say
+        # that here: the bare FileNotFoundError from the load below points at
+        # the checkpoint path and hides the real problem.
+        raise RuntimeError(
+            f"[{tag}] no epoch improved on the selection metric, so no checkpoint "
+            f"was saved. mean_auc stayed NaN/-1 across all {total_epochs} epochs -- "
+            f"check that the VAL split contains both classes for the heads driving "
+            f"selection (modality={modality}: "
+            f"{'video' if modality == 'video_only' else 'audio' if modality == 'audio_only' else 'video+audio'}). "
+            f"Val class counts are printed by build_3way_split_packed above.")
 
     load_portable_state_dict(
         model_local, torch.load(ckpt_path, map_location=device, weights_only=False))
@@ -1737,7 +2538,7 @@ def run_training_pipeline(manifest, crop_dir, cfg, tag="main", seed=None, verbos
                   f"chance => generalisation gap.")
 
     return {"tag": tag, "seed": seed, "checkpoint_path": ckpt_path, "cfg": cfg,
-            "best_epoch": best["epoch"] + 1, "best_val": best,
+            "best_epoch": best["epoch"] + 1, "best_val": best, "stop_reason": stop_reason,
             "train_idx": train_idx, "val_idx": val_idx, "test_idx": test_idx,
             "train_loader": train_loader, "val_loader": val_loader,
             "test_loader": test_loader, "model": model_local}
@@ -1775,24 +2576,30 @@ def mc_collect(model, loader, cfg, n_samples=20, need_sync=True, need_fusion=Tru
     acc = defaultdict(lambda: defaultdict(list))
     with torch.no_grad():
         for batch in loader:
-            crops, mfcc, sync_a, sync_off, vlab, alab, mask, _gid = [
+            crops, mfcc, sync_a, sync_off, vlab, alab, mask, _gid, has_a = [
                 b.to(device, non_blocking=True) for b in batch]
             tokens = m.encode_visual(crops)
             got = mc_logits(m, crops, mfcc, sync_a, mask, n_samples, tokens=tokens)
-            pairs = [("video", vlab), ("audio", alab)]
+            # Same masking rule as evaluate_deterministic: audio-dependent
+            # heads see only rows that have audio.
+            keep = has_a.bool().cpu().numpy()
+            pairs = [("video", vlab, None), ("audio", alab, keep)]
             if need_fusion and "fusion" in got:
-                pairs.append(("fusion", torch.clamp(vlab + alab, 0, 1)))
-            for head, lab in pairs:
+                pairs.append(("fusion", torch.clamp(vlab + alab, 0, 1), keep))
+            for head, lab, sel in pairs:
                 if head not in got:
                     continue
-                lg = got[head]
+                lg = got[head] if sel is None else got[head][:, sel]
+                lab_np = lab.cpu().numpy()
                 acc[head]["mean_logit"].extend(lg.mean(axis=0).tolist())
                 acc[head]["std_prob"].extend(
                     (1 / (1 + np.exp(-lg))).std(axis=0).tolist())
-                acc[head]["true"].extend(lab.cpu().numpy().tolist())
+                acc[head]["true"].extend(
+                    (lab_np if sel is None else lab_np[sel]).tolist())
             if need_sync and "sync" in got:
                 neg = mc_logits(m, crops, mfcc, sync_off, mask, n_samples, tokens=tokens)
                 for src, lab in ((got["sync"], 0), (neg["sync"], 1)):
+                    src = src[:, keep]
                     acc["sync"]["mean_logit"].extend(src.mean(axis=0).tolist())
                     acc["sync"]["std_prob"].extend(
                         (1 / (1 + np.exp(-src))).std(axis=0).tolist())
