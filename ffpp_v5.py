@@ -7,7 +7,7 @@ cleared both preregistered gates zero-shot: Celeb-DF 0.9186 (gate 0.85),
 DFDC 0.8494 (gate 0.75).  The encoder (`ffpp-encoder-v5`) then drove the
 cross-dataset gain in B-train/C-eval (mean AUC 0.61 -> 0.855); the D2 ablation
 shows this pretraining stage, not merely mixing FF++ rows into training, is the
-ingredient that matters.  Numbers, caveats: README.md "Post-paper results".
+ingredient that matters.  Numbers and caveats: README.md and CLAUDE.md.
 
 WHY THIS STAGE EXISTS
 ---------------------

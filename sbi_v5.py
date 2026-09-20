@@ -8,7 +8,7 @@ shortcut was found and fixed (global photometric statistics leaking the label)
 but zero-shot got worse, so the diagnosis was incomplete.  Superseded by the
 CLIP ViT-L/14 + FF++ pretraining in ffpp_v5.py / B1-ffpp-pretrain.ipynb, which
 passed its gate (Celeb-DF 0.9186, DFDC 0.8494).  See the negative-results
-ledger in CLAUDE.md and README.md.
+ledger in CLAUDE.md.
 
 WHY THIS EXISTS
 ---------------

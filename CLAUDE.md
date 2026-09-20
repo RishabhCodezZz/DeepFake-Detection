@@ -11,7 +11,7 @@ unseen datasets — is fixed and explained:
 | Zero-shot video AUC | DFDC | Celeb-DF v2 | Mean |
 |---|---|---|---|
 | Paper (EfficientNet-B4, FakeAVCeleb only) | 0.5799 | 0.6399 | **0.6099** |
-| CLIP ViT-L/14 + FF++ pretraining (final `B-train` model) | **0.8649** [0.824, 0.901] | **0.8447** [0.781, 0.903] | **0.8548** |
+| CLIP ViT-L/14 + FF++ pretraining (final `B-train` model) | **0.8649** [0.824, 0.901] | **0.8447** [0.781, 0.902] | **0.8548** |
 
 Attribution ablation (single seed, reduced budget; mean cross-dataset AUC): **A4 full recipe 0.851 ≈
 A13 no FF++ in the mix 0.846 > A15 no FF++ pretraining 0.750 > A14 EfficientNet + FF++ 0.550.** The
@@ -19,7 +19,7 @@ FF++ *pretraining* of the CLIP encoder is the ingredient that matters; mixing FF
 fine-tuning adds nothing; FF++ data without CLIP does nothing.
 
 **Done:** paper (submitted, frozen) · sync head investigated and cut · SBI cut · Track C
-(A3 → B1 gate → B-train → C-eval) · attribution ablation (D2) · README post-paper section ·
+(A3 → B1 gate → B-train → C-eval) · attribution ablation (D2) · README rewritten to show the current results only ·
 pushed to GitHub (commit `fbf43bb`, tag `paper-v1` on `dacd546`).
 
 **Open / optional:** `X1` ablation (plain CLIP, no FF++ at all) never run, so "is it just CLIP?" is
@@ -37,13 +37,15 @@ wall-clock budget, A14 hit its epoch cap → lower bounds · results are still b
 
 Audio-visual deepfake detection. A shared visual backbone + a temporal audio encoder feed four
 heads (`video`, `audio`, `sync`, `fusion`) — see [README.md](README.md) for the architecture
-table and results. The project's stated emphasis is **evaluation honesty**: negative results are
+table and the current results. The project's stated emphasis is **evaluation honesty**: negative results are
 reported, not tuned away. Three are on the record (SBI pretraining, cut; the sync head, chance-level
 and now fully diagnosed and cut; `nn.DataParallel`, unusable for the CLIP backbone).
 
-A paper draft covering the results in `README.md`'s first sections has been submitted and is frozen —
-its exact code is git tag `paper-v1` (commit `dacd546`). Everything after that is a **separate,
-ungraded "major project" track** (CLIP + FF++), documented in README's "Post-paper results".
+A paper draft covering the EfficientNet-B4 baseline results has been submitted and is frozen — its
+exact code is git tag `paper-v1` (commit `dacd546`), and its result artifacts are the repo-root PNG/JSON
+files. Everything after that is a **separate, ungraded "major project" track** (CLIP + FF++). The README
+was rewritten on 2026-09-20 to show only the current results (the paper-era sections and the negative
+results were dropped from it by choice); the full history, negative results included, stays here.
 
 ## Two unrelated "A" naming schemes — do not conflate them
 
@@ -75,16 +77,17 @@ letter by pure coincidence and mean nothing to each other.
 | `notebooks/C-eval.ipynb` | Calibration, in-domain test report, cross-dataset suite, figures. **Ran.** |
 | `notebooks/D-ablations.ipynb` | Old 16-row grid; scores in-domain only. A1–A12 are the paper's ablations. **Not run against the CLIP config.** |
 | `notebooks/D2-ablation-attribution.ipynb` | Attribution ablation scored on Celeb-DF + DFDC. **A4/A13/A14/A15 ran; `X1` not run.** |
-| `README.md` | Paper results (first sections, code at tag `paper-v1`) + "Post-paper results" section. |
+| `README.md` | Public write-up of the CURRENT results (CLIP + FF++), how it works, ablation, how to run. Deliberately omits the paper-era baseline sections and the negative results (see this file). |
 | `results/` | **Post-paper** results: `crossdataset_results_v5.json`, `calibration_v5.json`, `figures/`, `ablation_attribution_v5.csv` (all 4 D2 arms), `ablation_results_v5.csv` (paper's A1–A12), `executed/`. |
 | repo-root `*.png`, `calibration_v5.json`, `crossdataset_results_v5.json` | **The paper's** result artifacts (EfficientNet-B4). Do not overwrite; new runs go in `results/`. |
 | `.gitignore` | Excludes checkpoints/features (`*.pth`, `*.npy`, …), caches, data, and Kaggle output leftovers. |
 
 ## Results provenance — which numbers belong to which model
 
-- **Paper (EfficientNet-B4, FakeAVCeleb only):** `README.md` sections up to "Ablations", the repo-root
+- **Paper (EfficientNet-B4, FakeAVCeleb only):** no longer in `README.md` (removed 2026-09-20; older
+  versions are in git history and at tag `paper-v1`), the repo-root
   `*.png` / `*.json`, and `results/ablation_results_v5.csv`. Reproducible from tag `paper-v1`.
-- **Post-paper (CLIP ViT-L/14 + FF++):** README "Post-paper results" and everything in `results/`
+- **Current (CLIP ViT-L/14 + FF++):** everything in `README.md` and everything in `results/`
   except `ablation_results_v5.csv`. `crossfuse_v5.py`'s `CONFIG` on `main` describes THIS model
   (`BACKBONE="clip_vit_l14"`, `FREEZE_BLOCKS=0`, LayerNorm-only tuning, merged manifest,
   `PRETRAINED_ENCODER` from B1).
@@ -246,6 +249,15 @@ accuracy does not transfer with AUC.
 
 _Most recent first. Add an entry after every Kaggle run or consistency pass._
 
+- **2026-09-20 (README rewrite — local, not yet committed)** — On request, `README.md` was rewritten
+  to show only the good, current results: dropped the paper-era baseline sections, the negative-results
+  sections and the paper ablation table; kept the baseline only as the "before" column. Removed
+  material is in git history (and at tag `paper-v1`); the full negative-results story remains in this
+  file. Kept honest qualifiers in a short "Notes on the numbers" section (single seed, ±0.05 CIs,
+  AUC vs threshold accuracy, time-limited arms) and described `sync` as experimental/not used for
+  verdicts, so the README does not overstate. Added a per-clip attribution stat (288/309 correct
+  four-way, read from `results/figures/modality_attribution_4way.png`). Cross-references to the old
+  README sections were updated in this file, `sbi_v5.py`, `ffpp_v5.py` and the D2 notebook.
 - **2026-09-20 (consistency + cleanup pass — local, not yet committed)** — Audited every tracked file
   against the current state. `CLAUDE.md` rewritten (status-at-a-glance, corrected layout/provenance,
   sync section marked CLOSED, Track C marked DONE, references to removed files dropped).
