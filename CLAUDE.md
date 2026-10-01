@@ -15,8 +15,9 @@ unseen datasets — is fixed and explained:
 
 Attribution ablation (single seed, reduced budget; mean cross-dataset AUC): **A4 full recipe 0.851 ≈
 A13 no FF++ in the mix 0.846 > A15 no FF++ pretraining 0.750 > A14 EfficientNet + FF++ 0.550.** The
-FF++ *pretraining* of the CLIP encoder is the ingredient that matters; mixing FF++ rows into
-fine-tuning adds nothing; FF++ data without CLIP does nothing.
+FF++ *pretraining* of the CLIP encoder looks like the ingredient that matters (A15 is confounded by
+`LR_LN` 1e-5 vs 1e-4, so this is a hypothesis); mixing FF++ rows into fine-tuning shows no detectable
+difference; the EfficientNet arm (A14) was undertrained, so it says nothing about FF++ data without CLIP.
 
 **Done:** paper (submitted, frozen) · sync head investigated and cut · SBI cut · Track C
 (A3 → B1 gate → B-train → C-eval) · attribution ablation (D2) · README rewritten to show the current results only ·
@@ -66,7 +67,7 @@ letter by pure coincidence and mean nothing to each other.
 | `ffpp_v5.py` | FF++ pipeline for the CLIP track: discovery (canonical and flat mirrors), identity-disjoint splitting, `FFPPClassifier`, `train_ffpp_encoder`, zero-shot eval. **Ran; gate passed.** |
 | `sbi_v5.py` | Self-Blended Images pretraining. **Cut** (negative result). Kept for the record; imported by no current notebook. |
 | `verify_sync_fix.py` | Offline (CPU) 69-check verification of the sync rewrite. Passed 2026-08-16; not re-run since (see Current status caveats / env note). |
-| `tests/test_should_stop.py` | Unit tests for the stopping rule (4 pass). Run: `python -m pytest tests -q`. |
+| `tests/` | CPU unit tests (47 pass + 1 strict xfail): stopping rule, NumPy metrics vs brute force, identity-disjoint splitting (incl. `train_only` pinning and the val/test-invariant-to-FF++ property C-eval relies on), sync-profile / masked pooling helpers, MC-Dropout. The xfail documents that `enable_mc_dropout` does not make transformer/attention layers stochastic. Run: `python -m pytest tests -q`. CI: `.github/workflows/tests.yml`. Deps: `requirements.txt`. |
 | `notebooks/A-extract.ipynb` | FakeAVCeleb crops + audio cache → Kaggle Dataset `crops-v5`. Ran (paper). |
 | `notebooks/A2-ffpp-extract.ipynb` | Old FF++ real-only extraction for the cut SBI stage. **Superseded by A3.** |
 | `notebooks/A3-ffpp-full-extract.ipynb` | FF++ real + 4 fake families → `ffpp-crops-v5` (5,000 videos). **Ran.** |
@@ -249,6 +250,16 @@ accuracy does not transfer with AUC.
 
 _Most recent first. Add an entry after every Kaggle run or consistency pass._
 
+- **2026-10-02 (review round 2: text fixes, tests, CI — Phase 1)** — Second review (7/10; no leakage, no
+  metric bug) listed new issues. Done locally: stale/over-claiming text fixed (CLAUDE.md status, `ffpp_v5.py`
+  header, D2 intro, `self_blend_clip` docstring which wrongly said the SBI recipe was in use); README now
+  discloses self-blend (25% of real train windows, every arm), 2-identity test split, Celeb-DF class prior,
+  audio head FakeAVCeleb-only, sync at chance, baseline-vs-new scoring protocol (baseline `crops[:W]` =
+  first window only; new = 2 windows), MC-Dropout scope; B1 notebook `MULTI_GPU` forced False; added
+  `requirements.txt`, GitHub Actions pytest, 43 new tests (mutation-checked: 5/5 injected bugs caught).
+  Verified MC-Dropout limitation: transformer/attention dropout stays off (strict xfail). **Still open
+  (needs Kaggle/GPU):** BatchNorm fed by silent-audio FF++ rows, scorer drops frames 24-31, FF++ frames
+  non-contiguous, A15 at `LR_LN=1e-4`, `X1`, audio zero-shot cells, per-clip scores, missing B1/B-train JSONs.
 - **2026-10-02 (README claim fixes after code review)** — A review found no leakage or metric bugs but
   several over-claims. README fixes: baseline described as trained on FakeAVCeleb alone (was "same data");
   ablation reading softened (FF++ in the mix = "no detectable difference", A14 undertrained, A15 confounded

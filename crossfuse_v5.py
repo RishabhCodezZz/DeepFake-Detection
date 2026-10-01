@@ -1525,10 +1525,11 @@ def self_blend_clip(window, rng):
     soft mask, producing a blending boundary from a single real identity with
     no external generator fingerprint.
 
-    NOTE: this is the lightweight in-training version, kept for the
-    FakeAVCeleb hard-negative role it played in v4.  The FF++ pretraining
-    stage uses the full landmark-driven SBI recipe in `sbi_v5.py`, which is
-    what the cross-dataset generalization claim rests on."""
+    NOTE: this is the lightweight in-training version.  It is still ON in
+    every training run (`GENERATE_HARD_NEGATIVES`): a fraction of real
+    training windows, FF++ real rows included, is blended and relabelled fake.
+    The full landmark-driven SBI recipe in `sbi_v5.py` was cut (negative
+    result) and plays no part in the final model or its generalization."""
     out = window.copy()
     T, h, w, _ = window.shape
     mask = _soft_ellipse_mask(h, w, rng)

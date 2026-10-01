@@ -14,7 +14,7 @@ On two datasets it never saw during training, Celeb-DF v2 and DFDC, it averages 
 | Celeb-DF v2 | 400 | 0.640 | **0.845** | [0.781, 0.902] |
 | Mean | | 0.610 | **0.855** | |
 
-AUC is the chance that the model scores a random fake higher than a random real clip. 0.5 is a coin flip and 1.0 is perfect. The baseline is the same code with an EfficientNet-B4 backbone trained on FakeAVCeleb alone. Its intervals do not overlap CrossFuse's on either dataset.
+AUC is the chance that the model scores a random fake higher than a random real clip. 0.5 is a coin flip and 1.0 is perfect. The baseline is the earlier EfficientNet-B4 model, trained on FakeAVCeleb alone. Its intervals do not overlap CrossFuse's on either dataset. The two were not scored identically: the baseline used one 12-frame window per video, CrossFuse averages two windows, so the comparison is close but not exact.
 
 ### FakeAVCeleb test set (identities held out, 309 clips)
 
@@ -36,7 +36,7 @@ FakeAVCeleb labels the picture and the sound separately, so every clip is one of
 
 The input is a 12-frame window of cropped faces plus audio features (MFCC and a log-mel spectrogram).
 
-**Backbone.** The visual encoder is CLIP ViT-L/14. Everything is frozen except its LayerNorm parameters, so very little of the model is actually trained. LNCLIP-DF and Effort report that this recipe transfers well across deepfake datasets.
+**Backbone.** The visual encoder is CLIP ViT-L/14. Everything is frozen except its LayerNorm parameters, so very little of the model is actually trained. LNCLIP-DF reports that LayerNorm-only tuning transfers well across deepfake datasets, and Effort gets similar numbers by tuning a different small slice of the same backbone.
 
 **Two training stages.**
 
@@ -48,9 +48,9 @@ The input is a 12-frame window of cropped faces plus audio features (MFCC and a 
 | Head | Sees | Answers |
 |---|---|---|
 | `video` | face frames only | Is the picture manipulated? |
-| `audio` | audio only | Is the voice synthetic? |
+| `audio` | audio only | Is the voice synthetic? Checked on FakeAVCeleb only |
 | `fusion` | both, cross-attended | Is the clip fake at all? |
-| `sync` | mouth frames and audio | Do the lips match the speech? Experimental, not used for verdicts |
+| `sync` | mouth frames and audio | Do the lips match the speech? At chance (0.50 AUC), failed its gate, not used for verdicts |
 
 The video and audio heads never see each other's input. That is what makes the four-way breakdown above trustworthy: when the audio head says the voice is fake, it got there from the sound alone.
 
@@ -72,8 +72,8 @@ One confound remains. The multimodal stage tunes the LayerNorms at a learning ra
 ## Evaluation setup
 
 - **No identity leakage.** Splits are grouped by person, using union-find over the IDs in folder and file names, so a fake and its source identity always land on the same side. An assertion enforces it.
-- **Calibration.** Temperature and decision thresholds are fit on validation with the same 20-sample MC-Dropout estimate used at test time.
-- **Uncertainty.** Every number comes with its sample size and a bootstrap 95% interval.
+- **Calibration.** Temperature and decision thresholds are fit on validation with the same 20-sample MC-Dropout estimate used at test time. The visual backbone is run once, deterministically, and the 20 samples vary only the heads' ordinary dropout layers. Dropout inside the transformer and attention layers is not switched on (a unit test documents this), so the spread is narrower than full MC-Dropout.
+- **Uncertainty.** The cross-dataset numbers and the ablation scores come with their sample size and a bootstrap 95% interval. The FakeAVCeleb test table above does not.
 - **Fixed in advance.** The pretraining gate above was set before the run, not adjusted after.
 
 ## Running it
@@ -95,7 +95,7 @@ Everything runs as Kaggle notebooks, each publishing its output as a Kaggle Data
 
 `B-train` and each full-size ablation arm take several hours, so training stops itself before Kaggle's 9-hour session limit and keeps its best checkpoint.
 
-Offline checks: `python -m pytest tests -q` covers the stopping rule, and `python verify_sync_fix.py` runs the 69 CPU checks for the sync head.
+Offline checks: `pip install -r requirements.txt`, then `python -m pytest tests -q`. It covers the stopping rule, the NumPy metrics against brute-force definitions, identity-disjoint splitting, and the sync-profile and pooling helpers. GitHub Actions runs it on every push. `python verify_sync_fix.py` runs the separate 69 CPU checks for the sync head.
 
 | Path | What is there |
 |---|---|
@@ -108,6 +108,10 @@ Offline checks: `python -m pytest tests -q` covers the stopping rule, and `pytho
 
 ## Notes on the numbers
 
+- The FakeAVCeleb test split has only two identity groups, so 309 clips overstate how much independent evidence there is, and the 288/309 figure comes from those same two groups. The audio head has only been checked on FakeAVCeleb.
+- Training turns a quarter of the real windows into "fake" with a lightweight self-blend, in every run including the ablation arms. It is a standing ingredient that the ablation does not isolate.
+- Celeb-DF is mostly fake clips, so its 0.868 accuracy at the FakeAVCeleb threshold sits near what predicting "fake" every time would score. Compare models by AUC.
+- Celeb-DF and DFDC guided the method choices as well as scoring them, so "zero-shot" is slightly generous.
 - Each configuration is one training run. The bootstrap intervals are about ±0.05, so gaps smaller than that are not meaningful.
 - Ranking transfers better than the yes/no cutoff. The decision threshold is fit on FakeAVCeleb, and at that threshold DFDC accuracy is only 0.56 even though AUC is 0.865. Compare models by AUC.
 - The full-recipe and no-pretraining ablation arms stopped at their time limit, and the EfficientNet arm stopped at its epoch cap, so treat their scores as lower bounds.
