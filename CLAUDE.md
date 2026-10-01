@@ -20,13 +20,13 @@ fine-tuning adds nothing; FF++ data without CLIP does nothing.
 
 **Done:** paper (submitted, frozen) · sync head investigated and cut · SBI cut · Track C
 (A3 → B1 gate → B-train → C-eval) · attribution ablation (D2) · README rewritten to show the current results only ·
-pushed to GitHub (commit `fbf43bb`, tag `paper-v1` on `dacd546`).
+pushed to GitHub (`main`, tag `paper-v1` on `dacd546`); the cleanup pass and README rewrite are committed too.
 
 **Open / optional:** `X1` ablation (plain CLIP, no FF++ at all) never run, so "is it just CLIP?" is
 only partly answered · more seeds for error bars · the old 16-row `D-ablations` grid was never run
 against the CLIP config (and its `A16` row duplicates `A4`) · missing records: `best_metrics_v5.json`
-(B-train), `ffpp_zeroshot_v5.json` (B1), the executed `C-eval` notebook · local, uncommitted: the
-2026-09-20 consistency/cleanup pass (see Status log).
+(B-train), `ffpp_zeroshot_v5.json` (B1), the executed `C-eval` notebook · A15 (no FF++ pretraining) was run with `LR_LN=1e-5`
+vs 1e-4 in B1, so it confounds "pretraining" with "LayerNorms barely trained"; rerun at 1e-4 to settle it.
 
 **Caveats to state with any number:** one seed, bootstrap CIs ≈ ±0.05 · accuracy does not transfer with
 AUC (DFDC acc 0.557 at the FakeAVCeleb-fit threshold; Celeb-DF 0.868) · A4/A15 were stopped by a
@@ -249,7 +249,14 @@ accuracy does not transfer with AUC.
 
 _Most recent first. Add an entry after every Kaggle run or consistency pass._
 
-- **2026-09-20 (README rewrite — local, not yet committed)** — On request, `README.md` was rewritten
+- **2026-10-02 (README claim fixes after code review)** — A review found no leakage or metric bugs but
+  several over-claims. README fixes: baseline described as trained on FakeAVCeleb alone (was "same data");
+  ablation reading softened (FF++ in the mix = "no detectable difference", A14 undertrained, A15 confounded
+  by `LR_LN` 1e-5 vs 1e-4); A14 added to the lower-bound note. Not yet disclosed in the README (optional):
+  self-blend augmentation is on in every arm, sync is at chance, audio head validated in-domain only, test
+  split has 2 identity groups, baseline and new model were scored with different window protocols.
+
+- **2026-09-20 (README rewrite — committed `db17bc2`)** — On request, `README.md` was rewritten
   to show only the good, current results: dropped the paper-era baseline sections, the negative-results
   sections and the paper ablation table; kept the baseline only as the "before" column. Removed
   material is in git history (and at tag `paper-v1`); the full negative-results story remains in this
@@ -258,7 +265,7 @@ _Most recent first. Add an entry after every Kaggle run or consistency pass._
   verdicts, so the README does not overstate. Added a per-clip attribution stat (288/309 correct
   four-way, read from `results/figures/modality_attribution_4way.png`). Cross-references to the old
   README sections were updated in this file, `sbi_v5.py`, `ffpp_v5.py` and the D2 notebook.
-- **2026-09-20 (consistency + cleanup pass — local, not yet committed)** — Audited every tracked file
+- **2026-09-20 (consistency + cleanup pass — committed `d356f85`)** — Audited every tracked file
   against the current state. `CLAUDE.md` rewritten (status-at-a-glance, corrected layout/provenance,
   sync section marked CLOSED, Track C marked DONE, references to removed files dropped).
   `crossfuse_v5.py`: comment/docstring-only fixes (stale "FF++/SBI encoder", `MULTI_GPU` config

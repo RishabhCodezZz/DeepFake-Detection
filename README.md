@@ -2,7 +2,7 @@
 
 Audio-visual deepfake detection. Give CrossFuse a video clip and it tells you whether the face was faked, whether the voice was faked, and whether the clip is fake overall.
 
-On two datasets it never saw during training, Celeb-DF v2 and DFDC, it averages 0.855 AUC. The same pipeline with an EfficientNet backbone, trained on the same data, averages 0.610.
+On two datasets it never saw during training, Celeb-DF v2 and DFDC, it averages 0.855 AUC. The earlier EfficientNet-B4 baseline, trained on FakeAVCeleb alone, averages 0.610.
 
 ## Results
 
@@ -65,7 +65,9 @@ Three things changed compared with the baseline: the backbone, the FaceForensics
 | No FF++ pretraining | CLIP | no | yes | 0.785 | 0.716 | 0.750 |
 | EfficientNet backbone | EfficientNet-B4 | no | yes | 0.514 | 0.587 | 0.550 |
 
-The pretraining stage is what matters. Take it away and the mean drops by about 0.10. Take away the FaceForensics++ clips in the training mix and nothing changes, because the pretrained encoder already carries what they had to teach. FaceForensics++ data on an EfficientNet backbone does not help at all.
+The pretraining stage looks like the ingredient that matters. Take it away and the mean drops by about 0.10, mostly on Celeb-DF. Take away the FaceForensics++ clips in the training mix and there is no detectable difference: the per-dataset gaps (0.03 to 0.04) sit inside the ±0.05 intervals, and the two arms also got very different amounts of training (about 71 minutes against 426). The EfficientNet arm scored near chance, but it hit its epoch cap and its in-domain video AUC was only 0.727, so it is undertrained and cannot show that the data is useless to that backbone.
+
+One confound remains. The multimodal stage tunes the LayerNorms at a learning rate of 1e-5, ten times lower than the pretraining stage's 1e-4. The no-pretraining arm therefore cannot separate "the dedicated pretraining stage matters" from "the LayerNorms barely moved at the lower rate". Rerunning that arm at 1e-4 would settle it. That has not been done.
 
 ## Evaluation setup
 
@@ -108,7 +110,7 @@ Offline checks: `python -m pytest tests -q` covers the stopping rule, and `pytho
 
 - Each configuration is one training run. The bootstrap intervals are about ±0.05, so gaps smaller than that are not meaningful.
 - Ranking transfers better than the yes/no cutoff. The decision threshold is fit on FakeAVCeleb, and at that threshold DFDC accuracy is only 0.56 even though AUC is 0.865. Compare models by AUC.
-- The full-recipe and no-pretraining ablation arms stopped at their time limit, so treat their scores as lower bounds.
+- The full-recipe and no-pretraining ablation arms stopped at their time limit, and the EfficientNet arm stopped at its epoch cap, so treat their scores as lower bounds.
 
 ## Data and references
 
