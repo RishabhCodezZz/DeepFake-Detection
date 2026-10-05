@@ -42,7 +42,7 @@ the attribution CSV, not for the main checkpoint. No executed B-train log is ava
 The recovered B1 score artifact records Celeb-DF 0.9177758 and DFDC 0.8506696 (n=398),
 slightly different from the older 0.9186/0.8494 notes; both pass the gates. Historical log
 entries below remain historical claims and are superseded by this correction where they disagree.
-See [AUDIT.md](AUDIT.md) for repairs and limitations. Local reports are excluded from GitHub.
+Local reports are excluded from GitHub.
 
 ## What this project is
 
@@ -77,7 +77,7 @@ letter by pure coincidence and mean nothing to each other.
 | `ffpp_v5.py` | FF++ pipeline for the CLIP track: discovery (canonical and flat mirrors), identity-disjoint splitting, `FFPPClassifier`, `train_ffpp_encoder`, zero-shot eval. **Ran; gate passed.** |
 | `sbi_v5.py` | Self-Blended Images pretraining. **Cut** (negative result). Kept for the record; imported by no current notebook. |
 | `verify_sync_fix.py` | Offline (CPU) 69-check verification of the sync rewrite. All 69 passed again on 2026-10-05. |
-| `tests/` | CPU unit and regression tests (see AUDIT.md for current count): stopping rule, NumPy metrics vs brute force, identity-disjoint splitting (incl. `train_only` pinning and the val/test-invariant-to-FF++ property C-eval relies on), sync-profile / masked pooling helpers, MC-Dropout. The xfail documents that `enable_mc_dropout` does not make transformer/attention layers stochastic. Run: `python -m pytest tests -q`. CI: `.github/workflows/tests.yml`. Deps: `requirements.txt`. |
+| `tests/` | CPU unit and regression tests: stopping rule, NumPy metrics vs brute force, identity-disjoint splitting (incl. `train_only` pinning and the val/test-invariant-to-FF++ property C-eval relies on), sync-profile / masked pooling helpers, MC-Dropout. The xfail documents that `enable_mc_dropout` does not make transformer/attention layers stochastic. Run: `python -m pytest tests -q`. CI: `.github/workflows/tests.yml`. Deps: `requirements.txt`. |
 | `notebooks/A-extract.ipynb` | FakeAVCeleb crops + audio cache → Kaggle Dataset `crops-v5`. Ran (paper). |
 | `notebooks/A2-ffpp-extract.ipynb` | Old FF++ real-only extraction for the cut SBI stage. **Superseded by A3.** |
 | `notebooks/A3-ffpp-full-extract.ipynb` | FF++ real + 4 fake families → `ffpp-crops-v5` (5,000 videos). **Ran.** |

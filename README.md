@@ -107,7 +107,6 @@ Offline checks: `pip install -r requirements.txt`, then `python -m pytest tests 
 | `notebooks/` | The pipeline above |
 | `results/` | Metrics, calibration, figures and ablation CSVs |
 | `CLAUDE.md` | Working notes and full project history |
-| `AUDIT.md` | Directory audit, repairs, validation, and unresolved limitations |
 
 ## Notes on the numbers
 
