@@ -80,6 +80,14 @@ def test_val_and_test_are_identical_with_or_without_ffpp_rows():
     assert te0.tolist() == te1.tolist()
 
 
+def test_pinned_row_cannot_reintroduce_a_held_out_identity():
+    base = make_rows()
+    _, val, _ = build_3way_split_packed(base, seed=42, verbose=False)
+    pinned = dict(base[int(val[0])], train_only=True)
+    with pytest.raises(AssertionError, match="Pinned identity"):
+        build_3way_split_packed(base + [pinned], seed=42, verbose=False)
+
+
 def test_split_is_deterministic_for_a_seed_and_changes_with_it():
     rows = make_rows()
     a = build_3way_split_packed(rows, seed=1, verbose=False)

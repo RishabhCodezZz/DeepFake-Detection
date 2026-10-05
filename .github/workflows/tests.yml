@@ -22,3 +22,5 @@ jobs:
           pip install -r rest.txt
       - name: Run tests
         run: python -m pytest tests -q
+      - name: Verify sync architecture and checkpoint compatibility
+        run: python verify_sync_fix.py

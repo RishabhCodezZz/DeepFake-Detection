@@ -30,6 +30,8 @@ FakeAVCeleb labels the picture and the sound separately, so every clip is one of
 
 ![Fusion head: confusion matrix, ROC and reliability](results/figures/fusion_eval_panel.png)
 
+The saved panels preserve the original run. Their confusion matrices and ROC plots are usable, but their right-hand reliability curves incorrectly plotted fake probability against threshold-based accuracy. The evaluation template now plots confidence against correctness at 0.5, matching ECE. Regenerating those curves requires a new checkpoint evaluation; the historical PNGs have not been altered.
+
 ![Four-way modality attribution on the test set](results/figures/modality_attribution_4way.png)
 
 ## How it works
@@ -40,8 +42,8 @@ The input is a 12-frame window of cropped faces plus audio features (MFCC and a 
 
 **Two training stages.**
 
-1. Pretrain the encoder on FaceForensics++ (real videos plus four manipulation families: Deepfakes, Face2Face, FaceSwap, NeuralTextures). The encoder has to reach 0.85 on Celeb-DF and 0.75 on DFDC, zero-shot, before the next stage may use it. It reached 0.919 and 0.849.
-2. Train the full model on FakeAVCeleb with FaceForensics++ clips mixed in. Those clips have no audio, so the audio losses skip them, and they never appear in validation or test.
+1. Pretrain the encoder on FaceForensics++ (real videos plus four manipulation families: Deepfakes, Face2Face, FaceSwap, NeuralTextures). The encoder has to reach 0.85 on Celeb-DF and 0.75 on DFDC before the next stage may use it. The recovered score artifact records 0.918 and 0.851; earlier working notes recorded slightly different values (0.919 and 0.849). Both clear the gates, but the original B1 log is unavailable.
+2. Train the full model on FakeAVCeleb. The saved main training record reports **887 training clips**, 304 validation clips and 309 test clips, with an FF++-pretrained encoder. There is no executed B-train log to confirm the mixture previously claimed here. The 5,887-row FakeAVCeleb + FF++ mixture is recorded for separate ablation runs. The current B-train template supports that mixture: FF++ rows skip audio losses and stay out of validation and test.
 
 **Heads.**
 
@@ -56,7 +58,7 @@ The video and audio heads never see each other's input. That is what makes the f
 
 ## What made the difference
 
-Three things changed compared with the baseline: the backbone, the FaceForensics++ pretraining, and mixing FaceForensics++ into training. An ablation separates them. Each arm is one run with a shorter training budget, scored on the same Celeb-DF and DFDC clips as above.
+The comparison runs vary the backbone, FaceForensics++ pretraining, and the training mixture. Each arm is one run with a shorter training budget, scored on the same external pools as the main model. They do not isolate all three factors because their learning rates and training durations differ.
 
 | Arm | Backbone | FF++ pretraining | FF++ in training mix | DFDC | Celeb-DF | Mean |
 |---|---|---|---|---|---|---|
@@ -71,7 +73,7 @@ One confound remains. The multimodal stage tunes the LayerNorms at a learning ra
 
 ## Evaluation setup
 
-- **No identity leakage.** Splits are grouped by person, using union-find over the IDs in folder and file names, so a fake and its source identity always land on the same side. An assertion enforces it.
+- **FakeAVCeleb identity grouping.** Splits use union-find over the IDs in folder and file names, so a fake and its parsed source identity land on the same side. An assertion enforces it. FF++ pretraining prefers the official splits but has a target-ID fallback with possible source overlap; its executed split branch was not saved and cannot be certified as identity-disjoint.
 - **Calibration.** Temperature and decision thresholds are fit on validation with the same 20-sample MC-Dropout estimate used at test time. The visual backbone is run once, deterministically, and the 20 samples vary only the heads' ordinary dropout layers. Dropout inside the transformer and attention layers is not switched on (a unit test documents this), so the spread is narrower than full MC-Dropout.
 - **Uncertainty.** The cross-dataset numbers and the ablation scores come with their sample size and a bootstrap 95% interval. The FakeAVCeleb test table above does not.
 - **Fixed in advance.** The pretraining gate above was set before the run, not adjusted after.
@@ -85,7 +87,7 @@ Everything runs as Kaggle notebooks, each publishing its output as a Kaggle Data
 | `A-extract` | FakeAVCeleb face crops and audio features | `crops-v5` |
 | `A3-ffpp-full-extract` | FaceForensics++ face crops, all five families | `ffpp-crops-v5` |
 | `B1-ffpp-pretrain` | CLIP pretraining on FaceForensics++, with the gate | `ffpp-encoder-v5` |
-| `B-train` | Full multimodal training | `crossfuse-v5-ckpt` |
+| `B-train` | Full multimodal training, optionally with an FF++ mixture | `crossfuse-v5-ckpt` |
 | `C-eval` | Calibration, test report, cross-dataset evaluation, figures | `results/` |
 | `D2-ablation-attribution` | The ablation table above | CSV |
 
@@ -105,6 +107,7 @@ Offline checks: `pip install -r requirements.txt`, then `python -m pytest tests 
 | `notebooks/` | The pipeline above |
 | `results/` | Metrics, calibration, figures and ablation CSVs |
 | `CLAUDE.md` | Working notes and full project history |
+| `AUDIT.md` | Directory audit, repairs, validation, and unresolved limitations |
 
 ## Notes on the numbers
 
@@ -114,11 +117,11 @@ Offline checks: `pip install -r requirements.txt`, then `python -m pytest tests 
 - Celeb-DF and DFDC guided the method choices as well as scoring them, so "zero-shot" is slightly generous.
 - Each configuration is one training run. The bootstrap intervals are about ±0.05, so gaps smaller than that are not meaningful.
 - Ranking transfers better than the yes/no cutoff. The decision threshold is fit on FakeAVCeleb, and at that threshold DFDC accuracy is only 0.56 even though AUC is 0.865. Compare models by AUC.
-- The full-recipe and no-pretraining ablation arms stopped at their time limit, and the EfficientNet arm stopped at its epoch cap, so treat their scores as lower bounds.
+- The full-recipe and no-pretraining ablation arms stopped at their time limit, and the EfficientNet arm stopped at its epoch cap. Their training budgets are unequal; these scores are not mathematical lower bounds on later training performance.
 
 ## Data and references
 
-Datasets: FakeAVCeleb (training), FaceForensics++ c23 (pretraining and training mix), Celeb-DF v2 and the DFDC sample (evaluation). None are redistributed here.
+Datasets: FakeAVCeleb (main training), FaceForensics++ c23 (encoder pretraining and ablation mixtures), Celeb-DF v2 and the DFDC sample (evaluation and encoder acceptance). None are redistributed here.
 
 - LNCLIP-DF, [arXiv:2508.06248](https://arxiv.org/abs/2508.06248)
 - Effort, [arXiv:2411.15633](https://arxiv.org/abs/2411.15633)

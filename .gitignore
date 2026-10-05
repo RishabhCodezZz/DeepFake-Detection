@@ -29,6 +29,13 @@ Thumbs.db
 *.ipynb.bak
 .ipynb_checkpoints/
 
+# Local publication drafts and report exports
+reports/
+
+# Temporary audit extraction files
+audit_notebooks.txt
+audit_report_text.txt
+
 # Data
 data/
 crops_v5/

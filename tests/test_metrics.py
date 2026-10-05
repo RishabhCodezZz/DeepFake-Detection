@@ -60,6 +60,12 @@ def test_youden_threshold_separates_a_separable_set():
     assert youden_threshold([1, 1], [0.2, 0.9], default=0.42) == 0.42
 
 
+@pytest.mark.parametrize("scores", [[0.5, 0.5, 0.5, 0.5], [0.9, 0.8, 0.2, 0.1]])
+def test_youden_threshold_stays_finite_for_tied_or_inverted_scores(scores):
+    assert np.isfinite(youden_threshold([0, 0, 1, 1], scores))
+    assert np.isfinite(bootstrap_stable_threshold([0, 0, 1, 1], scores))
+
+
 def test_bootstrap_threshold_is_deterministic_for_a_seed():
     rng = np.random.RandomState(1)
     y = rng.randint(0, 2, 150)

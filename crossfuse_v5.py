@@ -48,8 +48,9 @@ WHAT CHANGED FROM v4, AND WHY
 6. CLIP backbone with LayerNorm-only tuning.  The EfficientNet/ImageNet
    visual encoder transfers poorly: 0.95 AUC in-domain on FakeAVCeleb against
    0.58/0.64 zero-shot on DFDC/Celeb-DF.  LNCLIP-DF (arXiv:2508.06248) and
-   Effort (ICML 2025, arXiv:2411.15633) independently converge on CLIP
-   ViT-L/14 frozen except its LayerNorm parameters, trained on FF++ c23.
+   Effort (ICML 2025, arXiv:2411.15633) both adapt CLIP ViT-L/14 on FF++.
+   LNCLIP-DF tunes LayerNorm parameters; Effort instead tunes an orthogonal
+   subspace of the pretrained weights.
    LNCLIP-DF's ablation on Celeb-DF v2: linear probe 78.1 -> +LN-tuning 94.9
    -> +L2-norm 96.2, while full fine-tuning and LoRA both overfit outright.
    `CLIPVisualBackbone` implements the backbone; the freeze/LR helpers on
@@ -475,12 +476,12 @@ def build_identity_groups(video_paths):
     for v in video_paths:
         toks = get_identity_tokens(v)
         path_tokens[v] = toks
-        toks = list(toks)
+        toks = sorted(toks)
         for t in toks[1:]:
             uf.union(toks[0], t)
         if len(toks) == 1:
             uf.find(toks[0])
-    return {v: uf.find(next(iter(path_tokens[v]))) for v in video_paths}
+    return {v: uf.find(min(path_tokens[v])) for v in video_paths}
 
 
 # =====================================================================
@@ -1781,6 +1782,8 @@ class PairedBatchSampler(Sampler):
     """
 
     def __init__(self, rows, indices, batch_size, seed=42, drop_last=True):
+        if batch_size < 2 or batch_size % 2:
+            raise ValueError("Paired batching requires an even batch_size >= 2")
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.seed = seed
@@ -1809,20 +1812,15 @@ class PairedBatchSampler(Sampler):
         flat = []
         for a, b in pairs:
             flat.extend([a, b])
-        # Interleave leftovers rather than appending them, so the tail
-        # batches are not systematically unpaired.
-        if singles:
-            step = max(1, len(flat) // (len(singles) + 1))
-            for j, s in enumerate(singles):
-                flat.insert(min(len(flat), (j + 1) * step + j), s)
-        batch = []
-        for idx in flat:
-            batch.append(idx)
-            if len(batch) == self.batch_size:
-                yield batch
-                batch = []
-        if batch and not self.drop_last:
-            yield batch
+        # Inserting individual leftovers between pair members can separate
+        # them across batches. Pack pairs first, then shuffle whole batches.
+        flat.extend(singles)
+        full = len(flat) // self.batch_size * self.batch_size
+        batches = [flat[i:i + self.batch_size] for i in range(0, full, self.batch_size)]
+        rng.shuffle(batches)
+        yield from batches
+        if full < len(flat) and not self.drop_last:
+            yield flat[full:]
 
     def __len__(self):
         n = len(self.pairs) * 2 + len(self.singles)
@@ -1845,10 +1843,11 @@ def merge_manifests(fav_rows, fav_crop_dir, ffpp_rows, ffpp_crop_dir,
     """One manifest spanning FakeAVCeleb and FF++, for joint visual training.
 
     FakeAVCeleb alone is ~97% Wav2Lip -- a mouth-region reenactment -- so a
-    video head trained only on it never sees a full-face swap and cannot
-    transfer to Celeb-DF or DFDC.  Adding FF++'s four swap families to the
-    SAME training mixture is the direct fix; keeping FakeAVCeleb in the
-    mixture is what preserves the audio, sync and fusion heads, which have
+    video head trained only on it has limited manipulation diversity.
+    Adding FF++'s four families is an optional data-mixture experiment;
+    the saved ablations do not establish a dependable mixture benefit.
+    Keeping FakeAVCeleb in the mixture supplies audio, sync and fusion
+    supervision, which has
     no FF++ counterpart.
 
     FF++ rows are tagged `has_audio=0`.  Every audio-dependent loss and
@@ -1947,6 +1946,12 @@ def build_3way_split_packed(rows, identity_disjoint=True, fracs=(0.60, 0.20, 0.2
         assert not (g_va & g_te), f"Identity leak val/test: {sorted(g_va & g_te)[:5]}"
 
     tr = list(tr) + pinned
+    if identity_disjoint:
+        # Include pinned rows in the final check: a generic train_only row
+        # must not reintroduce a held-out identity after the packing check.
+        g_tr = {rows[i]["identity_group"] for i in tr}
+        assert not g_tr & {rows[i]["identity_group"] for i in va}, "Pinned identity leaks into val"
+        assert not g_tr & {rows[i]["identity_group"] for i in te}, "Pinned identity leaks into test"
 
     if verbose:
         def _summary(name, ids):
@@ -2094,7 +2099,10 @@ def youden_threshold(y_true, y_prob, default=0.5):
     if len(set(y_true.astype(int).tolist())) < 2:
         return default
     fpr, tpr, thr = roc_curve(y_true, y_prob)
-    return float(thr[np.argmax(tpr - fpr)])
+    # The origin has threshold +inf. On tied/inverted scores its J=0 can
+    # win, which would serialize Infinity and classify every clip as real.
+    finite = np.isfinite(thr)
+    return float(thr[finite][np.argmax((tpr - fpr)[finite])])
 
 
 def expected_calibration_error(probs, labels, n_bins=15):
@@ -2250,6 +2258,8 @@ def run_training_pipeline(manifest, crop_dir, cfg, tag="main", seed=None, verbos
     seed = cfg["SEED"] if seed is None else seed
     seed_everything(seed)
     cfg = dict(cfg, SEED=seed)
+    if not isinstance(cfg["GRAD_ACCUM"], int) or cfg["GRAD_ACCUM"] < 1:
+        raise ValueError("GRAD_ACCUM must be a positive integer")
     torch.backends.cudnn.benchmark = True
 
     train_idx, val_idx, test_idx = build_3way_split_packed(
@@ -2272,6 +2282,8 @@ def run_training_pipeline(manifest, crop_dir, cfg, tag="main", seed=None, verbos
                                   drop_last=True, persistent_workers=(nw > 0), **common)
     val_loader = DataLoader(val_ds, batch_size=cfg["BATCH_CLIPS"], shuffle=False, **common)
     test_loader = DataLoader(test_ds, batch_size=cfg["BATCH_CLIPS"], shuffle=False, **common)
+    if not len(train_loader):
+        raise ValueError("Training loader is empty; reduce BATCH_CLIPS or provide more training rows")
 
     # PRETRAINED_BACKBONE=False is the control arm for "how much of the result
     # is CLIP's pretraining rather than our supervision", and lets the whole
@@ -2405,7 +2417,8 @@ def run_training_pipeline(manifest, crop_dir, cfg, tag="main", seed=None, verbos
                 if out["sync_logit"] is not None and modality == "both":
                     B = crops.size(0)
                     perm = torch.randperm(B, device=device)
-                    ok = gid[perm] != gid            # negative 1: another identity
+                    # Visual-only FF++ rows cannot supply an audio negative.
+                    ok = (gid[perm] != gid) & has_a[perm].bool()
                     if epoch == 0:
                         n_ok = int(ok.sum())
                         sync_neg_source["cross_identity"] += n_ok
@@ -2448,8 +2461,12 @@ def run_training_pipeline(manifest, crop_dir, cfg, tag="main", seed=None, verbos
                     tr["s_prob"].extend(sp[:B][keep_s]); tr["s_true"].extend([0] * int(keep_s.sum()))
                     tr["s_prob"].extend(sp[B:][keep_s]); tr["s_true"].extend([1] * int(keep_s.sum()))
 
-            scaler.scale(loss / cfg["GRAD_ACCUM"]).backward()
-            if (step + 1) % cfg["GRAD_ACCUM"] == 0:
+            # Normalize the final partial group by its actual size and flush
+            # it before validation, so its gradients are not discarded.
+            group_start = (step // cfg["GRAD_ACCUM"]) * cfg["GRAD_ACCUM"]
+            group_size = min(cfg["GRAD_ACCUM"], len(train_loader) - group_start)
+            scaler.scale(loss / group_size).backward()
+            if (step + 1) % cfg["GRAD_ACCUM"] == 0 or step + 1 == len(train_loader):
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model_local.parameters(), 1.0)
                 scaler.step(optimizer)

@@ -3,8 +3,9 @@ FF++ visual pretraining for CrossFuse -- shared library.
 
 STATUS (2026-09): RAN, GATE PASSED.  NB-B1 trained the CLIP ViT-L/14
 LayerNorm-tuned encoder on 5,000 FF++ c23 videos (real + 4 families) and it
-cleared both preregistered gates zero-shot: Celeb-DF 0.9186 (gate 0.85),
-DFDC 0.8494 (gate 0.75).  The encoder (`ffpp-encoder-v5`) then drove the
+cleared both preregistered gates. The recovered score artifact records
+Celeb-DF 0.9178 (gate 0.85), DFDC 0.8507 (gate 0.75); earlier notes differ
+slightly (0.9186/0.8494). The encoder (`ffpp-encoder-v5`) then drove the
 cross-dataset gain in B-train/C-eval (mean AUC 0.61 -> 0.855); the D2 ablation
 suggests this pretraining stage, not mixing FF++ rows into training, is what
 matters.  That reading is a hypothesis: the no-pretraining arm (A15) also ran
@@ -18,13 +19,12 @@ CrossFuse v5 scores 0.95 AUC in-domain on FakeAVCeleb but 0.58 (DFDC) and
 
 1. WRONG MANIPULATION FAMILY.  FakeAVCeleb is ~97% Wav2Lip, a mouth-region
    reenactment.  Celeb-DF and DFDC are full-face identity swaps.  The v5
-   video head never saw a face swap during training, so no amount of
-   architecture work could have fixed the gap.  FF++ supplies four swap /
+   training subset has limited manipulation diversity. FF++ supplies four swap /
    reenactment families (Deepfakes, Face2Face, FaceSwap, NeuralTextures).
 
-2. NON-TRANSFERABLE BACKBONE.  LNCLIP-DF (arXiv:2508.06248) and Effort
-   (ICML 2025, arXiv:2411.15633) independently land on CLIP ViT-L/14 frozen
-   except its LayerNorms, trained on FF++ c23.  LNCLIP-DF's Celeb-DF v2
+2. BACKBONE TRANSFER. LNCLIP-DF (arXiv:2508.06248) tunes CLIP LayerNorms;
+   Effort (ICML 2025, arXiv:2411.15633) adapts orthogonal weight subspaces.
+   Both motivate using CLIP ViT-L/14 with FF++ supervision. LNCLIP-DF's Celeb-DF v2
    ablation: linear probe 78.1 -> +LN-tuning 94.9 -> +L2-norm 96.2, with
    full fine-tuning and LoRA both overfitting outright.  This module
    implements LN-tuning + L2-norm and skips their alignment/uniformity/slerp
@@ -163,26 +163,29 @@ def discover_ffpp_videos(roots=("/kaggle/input",), compression="c23", verbose=Tr
                     # pattern below, just for the one family whose folder name isn't
                     # also its FFPP_METHODS key.
                     f"{root}/**/original/**/*.mp4"):
-            found["original"] += _glob.glob(pat, recursive=True)
-            if found["original"]:
+            hits = _glob.glob(pat, recursive=True)
+            if hits:
+                found["original"] += hits
                 break
         for meth in FFPP_METHODS:
             for pat in (f"{root}/**/manipulated_sequences/{meth}/{compression}/**/*.mp4",
                         f"{root}/**/manipulated_sequences/{meth}/**/*.mp4",
                         f"{root}/**/{meth}/**/*.mp4"):
-                found[meth] += _glob.glob(pat, recursive=True)
-                if found[meth]:
+                hits = _glob.glob(pat, recursive=True)
+                if hits:
+                    found[meth] += hits
                     break
 
     for k in found:
         allp = sorted(set(found[k]))
         # A broad glob can also match a c40 mirror nested underneath, which
-        # would train on a compression level we never meant to include.  Keep
-        # the filtered set when it is non-empty; fall back to everything for
-        # mirrors that carry no compression level in the path at all.
-        filtered = [p for p in allp
-                    if compression in p.replace("\\", "/").split("/")]
-        found[k] = filtered or allp
+        # would train on a compression level we never meant to include.
+        # Unlabelled flat mirrors are allowed; explicitly labelled c0/c23/
+        # c40 files must match the requested compression, even if none do.
+        levels = {"c0", "c23", "c40"}
+        found[k] = [p for p in allp
+                    if not (levels & set(p.replace("\\", "/").split("/")))
+                    or compression in p.replace("\\", "/").split("/")]
 
     if verbose:
         print(f"FF++ ({compression}) discovery:")
@@ -218,14 +221,17 @@ def build_ffpp_manifest(found, cap_per_method=None, seed=42, verbose=True):
                 "source_id": source or "",
             })
 
+    keys = [r["key"] for r in rows]
+    if len(keys) != len(set(keys)):
+        raise ValueError("Duplicate FF++ cache keys; attach only one mirror per method/compression")
     uf = UnionFind()
     for r in rows:
-        toks = list(ffpp_identity_tokens(r["path"]))
+        toks = sorted(ffpp_identity_tokens(r["path"]))
         for t in toks[1:]:
             uf.union(toks[0], t)
         uf.find(toks[0])
     for r in rows:
-        r["identity_group"] = uf.find(next(iter(ffpp_identity_tokens(r["path"]))))
+        r["identity_group"] = uf.find(min(ffpp_identity_tokens(r["path"])))
 
     if verbose:
         n_fake = sum(r["label"] for r in rows)
@@ -245,21 +251,31 @@ def load_ffpp_official_splits(roots=("/kaggle/input",)):
     import glob as _glob
     import json as _json
 
-    out = {}
-    for name in ("train", "val", "test"):
-        hits = [p for root in roots
-                for p in _glob.glob(f"{root}/**/{name}.json", recursive=True)]
-        for p in hits:
-            try:
-                with open(p) as f:
+    # All three files must belong to the same directory and contain FF++
+    # ID pairs. Arbitrary train.json files from other attached datasets
+    # must not be accepted or combined into a synthetic protocol.
+    hits = sorted(p for root in roots
+                  for p in _glob.glob(f"{root}/**/train.json", recursive=True))
+    for train_path in hits:
+        out = {}
+        try:
+            for name in ("train", "val", "test"):
+                with open(os.path.join(os.path.dirname(train_path), name + ".json")) as f:
                     data = _json.load(f)
-                ids = {str(x) for pair in data for x in pair}
-                if ids:
-                    out[name] = ids
-                    break
-            except Exception:
-                continue
-    return out if len(out) == 3 else None
+                if not isinstance(data, list) or not data or any(
+                    not isinstance(pair, list) or len(pair) != 2 or any(
+                        not isinstance(x, str) or re.fullmatch(r"\d{3}", x) is None
+                        for x in pair) for pair in data
+                ):
+                    raise ValueError("Not an FF++ split pair list")
+                out[name] = {x for pair in data for x in pair}
+            if any(out[a] & out[b] for a, b in
+                   (("train", "val"), ("train", "test"), ("val", "test"))):
+                raise ValueError("Overlapping FF++ split IDs")
+        except (OSError, ValueError, TypeError):
+            continue
+        return out
+    return None
 
 
 def split_ffpp_identity_disjoint(rows, fracs=(0.85, 0.15), seed=42,
@@ -291,6 +307,14 @@ def split_ffpp_identity_disjoint(rows, fracs=(0.85, 0.15), seed=42,
     if official_splits:
         train_ids = official_splits["train"]
         val_ids = official_splits["val"] | official_splits["test"]
+        if train_ids & val_ids:
+            raise ValueError("Official FF++ train and held-out IDs overlap")
+        for r in rows:
+            target, source = r["target_id"], r["source_id"]
+            if target not in train_ids | val_ids:
+                raise ValueError(f"FF++ target {target} is missing from official splits")
+            if source and source not in (train_ids if target in train_ids else val_ids):
+                raise ValueError(f"FF++ pair {target}_{source} crosses official splits")
         train_idx = [i for i, r in enumerate(rows) if r["target_id"] in train_ids]
         val_idx = [i for i, r in enumerate(rows) if r["target_id"] in val_ids]
         if verbose:
@@ -396,6 +420,8 @@ class PairedFrameSampler(Sampler):
     """
 
     def __init__(self, rows, indices, batch_size, seed=42, drop_last=True):
+        if batch_size < 2 or batch_size % 2:
+            raise ValueError("Paired batching requires an even batch_size >= 2")
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.seed = seed
@@ -435,18 +461,13 @@ class PairedFrameSampler(Sampler):
         flat = []
         for a, b in pairs:
             flat.extend([a, b])
-        if singles:
-            step = max(1, len(flat) // (len(singles) + 1))
-            for j, s in enumerate(singles):
-                flat.insert(min(len(flat), (j + 1) * step + j), s)
-        batch = []
-        for idx in flat:
-            batch.append(idx)
-            if len(batch) == self.batch_size:
-                yield batch
-                batch = []
-        if batch and not self.drop_last:
-            yield batch
+        flat.extend(singles)
+        full = len(flat) // self.batch_size * self.batch_size
+        batches = [flat[i:i + self.batch_size] for i in range(0, full, self.batch_size)]
+        rng.shuffle(batches)
+        yield from batches
+        if full < len(flat) and not self.drop_last:
+            yield flat[full:]
 
     def __len__(self):
         n = len(self.pairs) * 2 + len(self.singles)

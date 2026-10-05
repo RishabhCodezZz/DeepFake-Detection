@@ -3,7 +3,7 @@
 Living doc. Update **Current status** and the **Status log** at the bottom after every Kaggle run —
 everything between them should stay accurate for longer.
 
-## Current status (as of 2026-09-20)
+## Current status (audited 2026-10-05)
 
 **The main goal is met.** The paper's headline weakness — 0.95 in-domain but only ~0.61 zero-shot on
 unseen datasets — is fixed and explained:
@@ -25,14 +25,24 @@ pushed to GitHub (`main`, tag `paper-v1` on `dacd546`); the cleanup pass and REA
 
 **Open / optional:** `X1` ablation (plain CLIP, no FF++ at all) never run, so "is it just CLIP?" is
 only partly answered · more seeds for error bars · the old 16-row `D-ablations` grid was never run
-against the CLIP config (and its `A16` row duplicates `A4`) · missing records: `best_metrics_v5.json`
-(B-train), `ffpp_zeroshot_v5.json` (B1), the executed `C-eval` notebook · A15 (no FF++ pretraining) was run with `LR_LN=1e-5`
+against the CLIP config (`A16` duplicated `A4` and is now removed) · recovered records: `results/best_metrics_v5.json`,
+`results/ffpp_zeroshot_v5.json`, `results/executed/c-eval.executed.ipynb` · A15 (no FF++ pretraining) was run with `LR_LN=1e-5`
 vs 1e-4 in B1, so it confounds "pretraining" with "LayerNorms barely trained"; rerun at 1e-4 to settle it.
 
 **Caveats to state with any number:** one seed, bootstrap CIs ≈ ±0.05 · accuracy does not transfer with
 AUC (DFDC acc 0.557 at the FakeAVCeleb-fit threshold; Celeb-DF 0.868) · A4/A15 were stopped by a
-wall-clock budget, A14 hit its epoch cap → lower bounds · results are still below the literature
+wall-clock budget, A14 hit its epoch cap → unequal training exposure · results are still below the literature
 (LNCLIP-DF 96.5/87.0, Effort 95.6/85.4) · the FakeAVCeleb test split has only 2 identity groups.
+
+
+**Audit correction (2026-10-05):** `results/best_metrics_v5.json` records n_train=887,
+not 5,887. The main result is therefore described as FakeAVCeleb-only multimodal training
+with an FF++-pretrained encoder. Mixing 5,000 FF++ rows is established for A4/A15/A14 by
+the attribution CSV, not for the main checkpoint. No executed B-train log is available.
+The recovered B1 score artifact records Celeb-DF 0.9177758 and DFDC 0.8506696 (n=398),
+slightly different from the older 0.9186/0.8494 notes; both pass the gates. Historical log
+entries below remain historical claims and are superseded by this correction where they disagree.
+See [AUDIT.md](AUDIT.md) for repairs and limitations. Local reports are excluded from GitHub.
 
 ## What this project is
 
@@ -66,17 +76,17 @@ letter by pure coincidence and mean nothing to each other.
 | `crossfuse_v5.py` | The library: config, data pipeline, model, training loop (incl. `should_stop` + `TIME_BUDGET_S`), eval/calibration, NumPy reimplementations of the sklearn metrics. Imported by every notebook. |
 | `ffpp_v5.py` | FF++ pipeline for the CLIP track: discovery (canonical and flat mirrors), identity-disjoint splitting, `FFPPClassifier`, `train_ffpp_encoder`, zero-shot eval. **Ran; gate passed.** |
 | `sbi_v5.py` | Self-Blended Images pretraining. **Cut** (negative result). Kept for the record; imported by no current notebook. |
-| `verify_sync_fix.py` | Offline (CPU) 69-check verification of the sync rewrite. Passed 2026-08-16; not re-run since (see Current status caveats / env note). |
-| `tests/` | CPU unit tests (47 pass + 1 strict xfail): stopping rule, NumPy metrics vs brute force, identity-disjoint splitting (incl. `train_only` pinning and the val/test-invariant-to-FF++ property C-eval relies on), sync-profile / masked pooling helpers, MC-Dropout. The xfail documents that `enable_mc_dropout` does not make transformer/attention layers stochastic. Run: `python -m pytest tests -q`. CI: `.github/workflows/tests.yml`. Deps: `requirements.txt`. |
+| `verify_sync_fix.py` | Offline (CPU) 69-check verification of the sync rewrite. All 69 passed again on 2026-10-05. |
+| `tests/` | CPU unit and regression tests (see AUDIT.md for current count): stopping rule, NumPy metrics vs brute force, identity-disjoint splitting (incl. `train_only` pinning and the val/test-invariant-to-FF++ property C-eval relies on), sync-profile / masked pooling helpers, MC-Dropout. The xfail documents that `enable_mc_dropout` does not make transformer/attention layers stochastic. Run: `python -m pytest tests -q`. CI: `.github/workflows/tests.yml`. Deps: `requirements.txt`. |
 | `notebooks/A-extract.ipynb` | FakeAVCeleb crops + audio cache → Kaggle Dataset `crops-v5`. Ran (paper). |
 | `notebooks/A2-ffpp-extract.ipynb` | Old FF++ real-only extraction for the cut SBI stage. **Superseded by A3.** |
 | `notebooks/A3-ffpp-full-extract.ipynb` | FF++ real + 4 fake families → `ffpp-crops-v5` (5,000 videos). **Ran.** |
 | `notebooks/B0-sbi-pretrain.ipynb` | SBI pretraining. **Cut.** |
 | `notebooks/B1-ffpp-pretrain.ipynb` | CLIP ViT-L/14 LayerNorm-tuned FF++ pretraining → `ffpp-encoder-v5`. **Ran; gate passed** (Celeb-DF 0.9186 / DFDC 0.8494). |
 | `notebooks/B2-sync-probe.ipynb` | Sync-head probe. **Ran; both archs failed the 0.70 gate → sync cut.** Executed copy: `results/executed/`. |
-| `notebooks/B-train.ipynb` | Multimodal training on the merged FakeAVCeleb+FF++ manifest, from the FF++ encoder. **Ran** (1 seed, single T4). |
+| `notebooks/B-train.ipynb` | Template supports an optional FF++ mixture. Saved main run records 887 FakeAVCeleb training clips and the FF++ encoder (1 seed, single T4); no executed B-train log survives. |
 | `notebooks/C-eval.ipynb` | Calibration, in-domain test report, cross-dataset suite, figures. **Ran.** |
-| `notebooks/D-ablations.ipynb` | Old 16-row grid; scores in-domain only. A1–A12 are the paper's ablations. **Not run against the CLIP config.** |
+| `notebooks/D-ablations.ipynb` | Old grid (now 15 rows after removing unsupported A16); scores in-domain only. A1–A12 are the paper's ablations. **Not run against the CLIP config.** |
 | `notebooks/D2-ablation-attribution.ipynb` | Attribution ablation scored on Celeb-DF + DFDC. **A4/A13/A14/A15 ran; `X1` not run.** |
 | `README.md` | Public write-up of the CURRENT results (CLIP + FF++), how it works, ablation, how to run. Deliberately omits the paper-era baseline sections and the negative results (see this file). |
 | `results/` | **Post-paper** results: `crossdataset_results_v5.json`, `calibration_v5.json`, `figures/`, `ablation_attribution_v5.csv` (all 4 D2 arms), `ablation_results_v5.csv` (paper's A1–A12), `executed/`. |
@@ -90,7 +100,7 @@ letter by pure coincidence and mean nothing to each other.
   `*.png` / `*.json`, and `results/ablation_results_v5.csv`. Reproducible from tag `paper-v1`.
 - **Current (CLIP ViT-L/14 + FF++):** everything in `README.md` and everything in `results/`
   except `ablation_results_v5.csv`. `crossfuse_v5.py`'s `CONFIG` on `main` describes THIS model
-  (`BACKBONE="clip_vit_l14"`, `FREEZE_BLOCKS=0`, LayerNorm-only tuning, merged manifest,
+  (`BACKBONE="clip_vit_l14"`, `FREEZE_BLOCKS=0`, LayerNorm-only tuning, optional merged manifest,
   `PRETRAINED_ENCODER` from B1).
 - Don't compare the paper's ablation table with the D2 table: different backbone, different metric
   (in-domain vs zero-shot cross-dataset).
@@ -156,7 +166,7 @@ and a "latest" Kaggle environment (an old pinned environment ships torch 1.3 and
 - **Runs must fit Kaggle's 9 h session / 30 h-per-week cap.** `should_stop` (patience in fine-tune
   phase + `TIME_BUDGET_S`) ends a run cleanly with its best checkpoint; `run_training_pipeline`
   returns `stop_reason` (`None` / `"patience"` / `"time_budget"`). An arm stopped by the time budget is
-  a lower bound, not a fair comparison — flag it.
+  an unequal-budget comparison, not a mathematical lower bound — flag it.
 - **Results live where their model lives:** new runs write to `results/`, never over the repo-root
   paper artifacts.
 
